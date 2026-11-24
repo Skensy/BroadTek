@@ -13,7 +13,7 @@ CORE      := src/core
 PLUGIN    := src/plugin
 BUILD     := build
 OUT       := $(BUILD)/out
-VERSION   := 0.3.0
+VERSION   := 0.3.1
 
 SDK   := $(shell xcrun --show-sdk-path 2>/dev/null)
 ARCH  := -arch x86_64
@@ -21,7 +21,7 @@ MINOS := -mmacosx-version-min=13.0
 CC    := xcrun clang
 CXX   := xcrun clang++
 
-CORE_SRCS := $(CORE)/bt_aes.c $(CORE)/bt_hci.c $(CORE)/bt_smp.c
+CORE_SRCS := $(CORE)/bt_adv.c $(CORE)/bt_aes.c $(CORE)/bt_hci.c $(CORE)/bt_smp.c
 CORE_HDRS := $(CORE)/bt_core.h
 
 # Which build is actually running is not a rhetorical question: a kext copied
@@ -58,7 +58,7 @@ KEXT_CXXFLAGS := $(ARCH) $(MINOS) -isysroot $(SDK) -nostdinc \
 HOST_CFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -Werror -I$(CORE) \
                -fsanitize=address,undefined -fno-sanitize-recover=all
 
-OBJS := $(BUILD)/obj/bt_aes.o $(BUILD)/obj/bt_hci.o $(BUILD)/obj/bt_smp.o \
+OBJS := $(BUILD)/obj/bt_adv.o $(BUILD)/obj/bt_aes.o $(BUILD)/obj/bt_hci.o $(BUILD)/obj/bt_smp.o \
         $(BUILD)/obj/kern_broadtek.o $(BUILD)/obj/kern_config.o $(BUILD)/obj/kern_usbclass.o \
         $(BUILD)/obj/kern_start.o \
         $(BUILD)/obj/plugin_start.o $(BUILD)/obj/kmod_info.o

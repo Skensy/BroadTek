@@ -298,23 +298,30 @@ enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
 
     if (len < (size_t)2 + plen) return BT_FORWARD;
 
-    if (code == EVT_CMD_COMPLETE) {
-        if (plen < 3) return BT_FORWARD;
-        uint16_t opcode = (uint16_t)(p[1] | (p[2] << 8));
-
-        /* A command BroadTek took on itself: the controller's refusal is
-         * replaced by the answer a controller with LL Privacy would give. */
+    /* An unsupported command may end with either event. Preserve the
+     * controller's command credits and complete the opcode the host issued. */
+    int complete = code == EVT_CMD_COMPLETE && plen >= 3;
+    int refused = code == EVT_CMD_STATUS && plen >= 4 && p[0] != 0;
+    if (complete || refused) {
+        uint8_t *op = &p[complete ? 1 : 2];
+        uint16_t opcode = (uint16_t)(op[0] | (op[1] << 8));
         struct bt_pending *pend = take_pending(c, opcode);
         if (pend != NULL) {
-            size_t need = 2 + 4 + pend->len;         /* header + num/opcode/status */
+            size_t need = 6u + pend->len;
             if (need <= cap) {
+                uint8_t credits = p[complete ? 0 : 1];
+                pkt[0] = EVT_CMD_COMPLETE;
                 pkt[1] = (uint8_t)(4 + pend->len);
-                p[3] = 0x00;                         /* success */
+                p[0] = credits;
+                p[1] = (uint8_t)opcode;
+                p[2] = (uint8_t)(opcode >> 8);
+                p[3] = 0;
                 for (uint8_t i = 0; i < pend->len; i++) p[4 + i] = pend->reply[i];
                 *out_len = need;
             }
             return BT_FORWARD;
         }
+        if (!complete) return BT_FORWARD;
 
         if (opcode == OP_LE_READ_FEATURES && plen >= 12 && p[3] == 0x00)
             p[4] |= 0x40;                            /* LL Privacy (feature bit 6) */
@@ -324,16 +331,6 @@ enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
             cmds[35] |= 0x1f;                        /* size, read RPAs, enable, timeout */
             cmds[39] |= 0x04;                        /* LE Set Privacy Mode */
         }
-        return BT_FORWARD;
-    }
-
-    /* A controller that does not know a command may answer with Command
-     * Status instead; the host would see a failure BroadTek has already
-     * promised to handle, so drop it and let the Command Complete stand. */
-    if (code == EVT_CMD_STATUS && plen >= 4) {
-        uint16_t opcode = (uint16_t)(p[2] | (p[3] << 8));
-        if (p[0] != 0x00 && take_pending(c, opcode) != NULL)
-            return BT_DROP;
         return BT_FORWARD;
     }
 

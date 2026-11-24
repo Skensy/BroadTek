@@ -139,16 +139,25 @@ and statuses only. `sudo ./uninstall.sh` removes the helper.
 | | |
 |---|---|
 | `-broadtekoff` | BroadTek does nothing |
+| `-broadtekobserve` | observe HCI traffic only (also selected by `efi/install.sh --stage off`) |
+| `-broadtekadvcache` | opt in to reusing successful per-set address commands until rotation, invalidation or sleep |
 | `-broadtekadvaddroff` | leave the adverts' addresses alone |
 | `-broadtekadvoff` | do not patch bluetoothd's advertising check |
 | `-broadtekrw` | the full stage: the software resolving list, needed for Watch unlock |
-| `-broadtekintel` / `-broadtekinteloff` | force the Intel fixes on, or off (they turn on by themselves for USB vendor `8087`) |
+| `-broadtekintel` / `-broadtekinteloff` | force the Intel fixes on, or off (automatic for a matched Intel USB HCI interface) |
 | `-broadtekreadyoff` | Intel: do not stand in for the link-ready reports |
 | `-broadtekdbg` | Lilu's debug output (in a debug build) |
 
 `ioreg -l | grep -i broadtek` shows what it did: `broadtek-adv-addr`,
 `broadtek-adv-injected` (adverts given their address) and the counters of
 what it saw on the HCI stream. No sudo needed.
+
+Version 0.3.1 declares Tahoe support directly in Lilu. The default install keeps
+the advertising fixes enabled. The HCI hooks follow the interrupt and bulk
+pipes of the first standard Bluetooth USB interface with both ACL directions.
+The `broadtek-endpoints` counters describe those pipes and are published at most
+four times per second during steady traffic. `broadtek-adv-cache` reports
+whether address caching is active.
 
 ## Building
 

@@ -7,8 +7,9 @@ install: Kernel -> Add gets BroadTek.kext, after Lilu.kext (it is a Lilu
 plugin and will not do anything if it loads first), and the boot-arg
 -broadtekdbg is added, which turns on its logging.
 
-STAGE says how much the plugin may change, and defaults to "off":
+STAGE says how much the plugin may change, and defaults to "default":
 
+  default standard advertising fixes
   off     observe only: nothing is rewritten, the hooks just report
   events  rewrite events only -- the features rewrite, nothing else can
           fire because no command reaches the core to populate its state
@@ -45,12 +46,12 @@ import sys
 MIN_KERNEL = '22.0.0'                    # Ventura
 BUNDLE = 'BroadTek.kext'
 BOOT_ARG = '-broadtekdbg'
-STAGES = {'off': None, 'events': '-broadtekrwev', 'full': '-broadtekrw',
+STAGES = {'default': None, 'off': '-broadtekobserve', 'events': '-broadtekrwev', 'full': '-broadtekrw',
           'classdry': '-broadtekclassdry', 'class': '-broadtekclass',
           'advaddr': '-broadtekadvaddr',
           'fulladv': ('-broadtekrw', '-broadtekadvaddr')}
 OUR_ARGS = ('-broadtekdbg', '-broadtekrw', '-broadtekrwev', '-broadtekoff',
-            '-broadtekclass', '-broadtekclassdry', '-broadtekadvaddr')
+            '-broadtekclass', '-broadtekclassdry', '-broadtekadvaddr', '-broadtekobserve')
 RIVAL = 'BTLEAdvFixup.kext'
 RIVAL_MARK = ' (off for BroadTek)'
 NVRAM_GUID = '7C436110-AB2A-4BBB-A880-FE41995C9F82'
@@ -90,7 +91,7 @@ def set_boot_args(config, changes, wanted, unwanted):
         changes.append('boot-args: ' + add[key])
 
 
-def install(config, changes, stage='off'):
+def install(config, changes, stage='default'):
     add = config['Kernel']['Add']
     paths = [e.get('BundlePath') for e in add]
     if 'Lilu.kext' not in paths:
@@ -146,10 +147,10 @@ def main():
     if len(sys.argv) not in (4, 5) or sys.argv[1] not in ('install', 'uninstall'):
         sys.exit(__doc__)
     mode, src, dst = sys.argv[1:4]
-    stage = sys.argv[4] if len(sys.argv) == 5 else 'off'
+    stage = sys.argv[4] if len(sys.argv) == 5 else 'default'
     if stage not in STAGES:
         sys.exit('unknown stage %r: expected one of %s' % (stage, ', '.join(STAGES)))
-    if mode == 'uninstall' and stage != 'off':
+    if mode == 'uninstall' and stage not in ('default', 'off'):
         sys.exit('uninstall takes no stage')
     with open(src, 'rb') as f:
         config = plistlib.load(f)

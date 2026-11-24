@@ -106,6 +106,44 @@ static void test_supported_commands_rewrite(void)
     CHECK((evt[6 + 39] & 0x04) == 0x04, "LE Set Privacy Mode bit (octet 39)");
 }
 
+static void test_advertising_cache(void)
+{
+    struct bt_adv_state s = {0};
+    uint8_t address[] = {1, 2, 3, 4, 5, 6}, out[6], params[11] = {0};
+    params[10] = 1;
+    bt_adv_command(&s, 0x2036, params, sizeof(params));
+    CHECK(!bt_adv_begin(&s, 0, 1, out), "a random address must be available");
+    bt_adv_command(&s, 0x2005, address, sizeof(address));
+    CHECK(bt_adv_begin(&s, 0, 1, out) && !memcmp(address, out, 6), "inject the first address");
+    CHECK(!bt_adv_begin(&s, 0, 1, out), "one outstanding command per controller");
+    CHECK(bt_adv_complete(&s, 0) && !bt_adv_begin(&s, 0, 1, out), "cache confirmed sets");
+    CHECK(!bt_adv_complete(&s, 0), "pass unrelated completions");
+    CHECK(bt_adv_begin(&s, 0, 0, out), "default mode refreshes on every enable");
+    bt_adv_complete(&s, 0x0c);
+    CHECK(bt_adv_begin(&s, 0, 1, out), "retry a controller error");
+    address[0]++;
+    bt_adv_command(&s, 0x2005, address, sizeof(address));
+    bt_adv_complete(&s, 0);
+    CHECK(bt_adv_begin(&s, 0, 1, out) && !memcmp(address, out, 6), "rotate during an injection");
+    bt_adv_complete(&s, 0);
+    params[0] = 2;
+    bt_adv_command(&s, 0x2036, params, sizeof(params));
+    CHECK(bt_adv_begin(&s, 2, 1, out), "each advertising handle has its own cache");
+    bt_adv_invalidate(&s);
+    bt_adv_complete(&s, 0);
+    CHECK(bt_adv_begin(&s, 2, 1, out), "a late completion cannot restore invalidated state");
+    bt_adv_complete(&s, 0);
+    bt_adv_command(&s, 0x203c, params, 1);
+    CHECK(!bt_adv_begin(&s, 2, 1, out), "a removed set must be configured again");
+    bt_adv_command(&s, 0x2036, params, sizeof(params));
+    CHECK(bt_adv_begin(&s, 2, 1, out), "recreated set needs its address");
+    bt_adv_command(&s, 0x2035, params, 7);
+    CHECK(!bt_adv_complete(&s, 0) && !bt_adv_begin(&s, 2, 0, out), "preserve native address commands");
+    CHECK(!bt_adv_complete(&s, 0) && bt_adv_begin(&s, 0, 0, out), "other sets still use the workaround");
+    bt_adv_command(&s, 0x0c03, NULL, 0);
+    CHECK(!s.native_sets && !s.native_replies && !s.have_address && !s.random_sets, "reset controller address state");
+}
+
 /* The controller rejects a command it does not know; BroadTek turns that
  * refusal into the answer a privacy-capable controller would have given. */
 static void test_refusal_becomes_answer(void)
@@ -140,9 +178,15 @@ static void test_refusal_becomes_answer(void)
     memcpy(&add[10], spec_irk, 16);
     bt_hci_on_command(&c, add, sizeof(add));
     uint8_t cs[] = {0x0f, 0x04, 0x01, 0x01, 0x27, 0x20};
+    cs[3] = 3;
+    memcpy(buf, cs, sizeof(cs));
+    n = on_event(&c, buf, sizeof(cs), sizeof(buf), &v);
+    const uint8_t completed[] = {0x0e, 4, 3, 0x27, 0x20, 0};
+    CHECK(v == BT_FORWARD && n == sizeof(completed) &&
+          memcmp(buf, completed, n) == 0, "complete a refused opcode with its original credits");
     memcpy(buf, cs, sizeof(cs));
     on_event(&c, buf, sizeof(cs), sizeof(buf), &v);
-    CHECK(v == BT_DROP, "a Command Status refusal is dropped");
+    CHECK(memcmp(buf, cs, sizeof(cs)) == 0, "an unsolicited refusal passes unchanged");
 }
 
 /* A reply must never be written past the buffer it arrived in. */
@@ -665,6 +709,7 @@ int main(void)
     test_ah();
     test_features_rewrite();
     test_supported_commands_rewrite();
+    test_advertising_cache();
     test_refusal_becomes_answer();
     test_reply_respects_capacity();
     test_resolving_list_full();

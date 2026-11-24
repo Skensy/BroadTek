@@ -54,6 +54,21 @@ struct bt_smp_capture {
     uint8_t  id_addr[6];
 };
 
+/* Address state for a single USB HCI controller. The plugin serializes
+ * access from command submission and interrupt completion. */
+struct bt_adv_state {
+    uint8_t address[6], have_address, handle, can_confirm;
+    uint16_t random_sets, confirmed_sets, native_sets;
+    uint32_t native_replies;
+    uint64_t serial, pending;
+};
+
+void bt_adv_invalidate(struct bt_adv_state *s);
+void bt_adv_reset(struct bt_adv_state *s);
+void bt_adv_command(struct bt_adv_state *s, uint16_t opcode, const uint8_t *p, size_t len);
+uint64_t bt_adv_begin(struct bt_adv_state *s, uint8_t handle, int cache, uint8_t address[6]);
+int bt_adv_complete(struct bt_adv_state *s, uint8_t status);
+
 struct bt_ctx {
     struct bt_rl_entry rl[BT_RL_SIZE];
     struct bt_pending pending[BT_PENDING_MAX];

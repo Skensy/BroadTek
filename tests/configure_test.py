@@ -83,7 +83,9 @@ def main():
         assert not [a for a in args(obs) if a.startswith('-broadtekrw')], args(obs)
         assert '-broadtekdbg' in args(obs), 'observing still logs'
 
-        assert args(run('install', fresh(), tmp)) == args(obs), 'off is the default'
+        assert '-broadtekobserve' in args(obs)
+        assert '-broadtekobserve' not in args(run('install', obs, tmp)), 'default restores advertising'
+        assert '-broadtekobserve' not in args(run('install', obs, tmp, stage='full'))
 
         gone = run('uninstall', full, tmp)
         assert not [a for a in args(gone) if a.startswith('-broadtek')], args(gone)

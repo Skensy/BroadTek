@@ -10,6 +10,8 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/thread_call.h>
 #include <sys/vnode.h>
 #include <IOKit/IOService.h>
@@ -19,6 +21,8 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
+#include <IOKit/usb/IOUSBHostInterface.h>
+#include <IOKit/usb/IOUSBHostDevice.h>
 #include <IOKit/usb/StandardUSB.h>
 
 #include "kern_broadtek.hpp"
@@ -41,9 +45,8 @@ extern "C" {
  * of looking for a hook that was already in the right place. */
 static inline bool isHCICommand(const StandardUSB::DeviceRequest &request)
 {
-    return (request.bmRequestType & 0x80) == 0x00 &&     /* host to device */
-           (request.bmRequestType & 0x60) == 0x20 &&     /* class-specific */
-           request.bRequest == 0x00;
+    return (request.bmRequestType == 0x20 || request.bmRequestType == 0x21) &&
+           request.bRequest == 0 && request.wValue == 0;
 }
 static constexpr size_t  kMaxHCI               = 260;
 /* Only the head of an ACL packet is read, because only the head can hold the
@@ -89,16 +92,16 @@ static IOSimpleLock *g_lock;
 static bool g_adv_addr;
 /* Set once an Intel Bluetooth device appears on USB (or by -broadtekintel). */
 static volatile bool g_intel;
+static bool g_intel_allowed, g_force_intel;
 static volatile SInt32 g_intel_inj_pending;
 static OSNumber *g_n_intel_pages;
 /* Completion context: the link-ready reports (below). Returns the new length
  * if it rewrote buf, 0 to pass the event on as it is. */
 static size_t intelOnEvent(uint8_t *buf, size_t len, size_t room);
 
-static uint8_t g_adv_rpa[6];
-static bool g_adv_have_rpa;
-static uint8_t g_adv_random[16];        /* per set: own type random in the last 0x2036 */
-static volatile SInt32 g_adv_inj_pending;
+static bt_adv_state g_adv_state;
+static IOLock *g_adv_send_lock;
+static bool g_adv_cache;
 static uint64_t g_adv_injected, g_adv_inj_timeouts, g_adv_inj_failed, g_adv_inj_cc;
 static uint8_t g_adv_inj_status = 0xff;
 static OSNumber *g_n_adv_injected, *g_n_adv_inj_timeouts, *g_n_adv_inj_failed, *g_n_adv_inj_cc;
@@ -158,9 +161,7 @@ static void tableFull()
     if (g_n_tables_full != nullptr) g_n_tables_full->setValue(g_tables_full);
 }
 
-/* IN transfers on a pipe of the right type but the wrong address: another
- * device's traffic, which earlier builds read as if it were the dongle's.
- * See isEventPipe() for why the address is what distinguishes them. */
+/* Candidate USB transfers outside the selected Bluetooth interface. */
 static uint64_t g_pipes_elsewhere;
 static OSNumber *g_n_pipes_elsewhere;
 
@@ -322,16 +323,8 @@ static void noteClient(IOService *forClient)
     if (platform != nullptr) platform->setProperty("broadtek-cmd-clients", names);
 }
 
-/* Which endpoints carry traffic, and what the interrupt IN endpoint is really
- * sending. isEventPipe() matches any interrupt IN endpoint on any device, so
- * a climbing event counter on its own does not prove the data is HCI -- there
- * is a webcam on this machine with an interrupt endpoint too. These two
- * tables are what settle it.
- *
- * The endpoint table is written from the caller, where allocating is allowed.
- * The event codes are recorded in the completion, where it is not: the
- * completion only stores into the array and sets a flag, and the next caller
- * publishes it. */
+/* Transfer counts for the selected interface. Only caller context publishes
+ * strings in the registry; completions mark the other tables dirty. */
 static constexpr int kEndpoints = 16;
 struct EndpointUse {
     uint8_t  addr;
@@ -386,17 +379,17 @@ static void noteL2cap(int dir, const uint8_t *acl, size_t len);
 static void clearL2capHandle(uint16_t handle);
 
 /* Caller context only. */
-static void publishTraffic()
+static void publishTraffic(const EndpointUse *eps, int count)
 {
     IORegistryEntry *platform = IOService::getPlatform();
     if (platform == nullptr) return;
 
     char line[256];
     size_t at = 0;
-    for (int i = 0; i < g_n_eps && at + 32 < sizeof(line); i++) {
+    for (int i = 0; i < count && at + 32 < sizeof(line); i++) {
         at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, "%s%02x:%s:%llu",
-                                           at > 0 ? " " : "", g_eps[i].addr,
-                                           epTypeName(g_eps[i].type), g_eps[i].count));
+                                           at > 0 ? " " : "", eps[i].addr,
+                                           epTypeName(eps[i].type), eps[i].count));
     }
     line[at] = '\0';
     platform->setProperty("broadtek-endpoints", line);
@@ -429,15 +422,27 @@ static void publishTraffic()
 static void noteEndpoint(const StandardUSB::EndpointDescriptor *ed)
 {
     if (ed == nullptr) return;
-    uint8_t addr = ed->bEndpointAddress;
-    for (int i = 0; i < g_n_eps; i++)
-        if (g_eps[i].addr == addr) { g_eps[i].count++; publishTraffic(); return; }
-    if (g_n_eps >= kEndpoints) { tableFull(); return; }
-    g_eps[g_n_eps].addr = addr;
-    g_eps[g_n_eps].type = static_cast<uint8_t>(ed->bmAttributes & 0x03);
-    g_eps[g_n_eps].count = 1;
-    g_n_eps++;
-    publishTraffic();
+    static uint64_t lastPublish;
+    EndpointUse snapshot[kEndpoints];
+    const uint8_t addr = ed->bEndpointAddress, type = ed->bmAttributes & 3;
+    uint64_t now;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    IOSimpleLockLock(g_lock);
+    int i = 0;
+    while (i < g_n_eps && (g_eps[i].addr != addr || g_eps[i].type != type)) i++;
+    if (i == kEndpoints) { IOSimpleLockUnlock(g_lock); tableFull(); return; }
+    bool fresh = i == g_n_eps;
+    if (fresh) g_eps[g_n_eps++] = EndpointUse{addr, type, 0};
+    g_eps[i].count++;
+    if (!fresh && (now <= lastPublish || now - lastPublish < 250000000ULL)) {
+        IOSimpleLockUnlock(g_lock);
+        return;
+    }
+    lastPublish = now;
+    int count = g_n_eps;
+    memcpy(snapshot, g_eps, static_cast<size_t>(count) * sizeof(EndpointUse));
+    IOSimpleLockUnlock(g_lock);
+    publishTraffic(snapshot, count);
 }
 
 /* Completion context: record only, never publish. */
@@ -1039,81 +1044,160 @@ static bool writeMD(IOMemoryDescriptor *md, const uint8_t *buf, size_t len)
     return true;
 }
 
-/* Which pipe belongs to the Bluetooth dongle.
- *
- * Testing only for "interrupt IN" or "bulk IN" matches those endpoints on
- * *every* USB device. One run proved how badly: of 21357 transfers counted as
- * ACL, about 21100 came from another device entirely, and its bulk IN
- * endpoint carried 27075 transfers through a completion routine that was
- * parsing each one for an SMP header.
- *
- * The right discriminator would be the parent device's vendor and product ID,
- * which IOUSBHostIOSource keeps in a tPacketFilterMetadata it does not expose:
- * the member is protected with no accessor, so reading it means trusting a
- * struct offset in a hot kernel path. Not worth it for an observation.
- *
- * So the endpoint address is used instead. The Bluetooth USB transport (Core
- * spec Vol 4 Part B) fixes the endpoint *types* but not their addresses;
- * in practice controllers use 0x81 for events and 0x82/0x02 for ACL, and this
- * dongle does. The other device on this machine uses 0x83 to 0x89 and 0x04 to
- * 0x07, so the two separate cleanly.
- *
- * The limitation is real: another device using 0x81 or 0x82 would be included
- * again. broadtek-pipes-elsewhere counts the transfers this test rejects, so
- * the assumption stays checkable rather than silent -- and if the dongle ever
- * used different addresses, that counter would be large while the HCI
- * counters stayed at zero. */
-static constexpr uint8_t kBtEventEndpoint = 0x81;
-static constexpr uint8_t kBtAclInEndpoint = 0x82;
-
-static bool isEventPipe(IOUSBHostPipe *pipe)
+static uint32_t writeEvent(IOMemoryDescriptor *md, const uint8_t *buf, size_t len, IOReturn &status)
 {
-    if (pipe == nullptr) return false;
-    const StandardUSB::EndpointDescriptor *ed = pipe->getEndpointDescriptor();
-    if (ed == nullptr) return false;
-    return (ed->bmAttributes & 0x03) == kIOUSBEndpointTypeInterrupt &&
-           ed->bEndpointAddress == kBtEventEndpoint;
+    if (writeMD(md, buf, len)) return static_cast<uint32_t>(len);
+    status = kIOReturnIOError;
+    return 0;
 }
 
-/* ACL data from the peer. This is where a bonding exchange carries the IRK,
- * in the clear, because the controller encrypts below HCI (src/core/bt_smp.c).
- * Only the IN direction matters: the key that resolves the peer's private
- * address is the peer's, and the one the Mac sends out is its own. */
-static bool isAclInPipe(IOUSBHostPipe *pipe)
+/* Endpoint addresses are local to an interface. Remember the actual pipes
+ * returned for the HCI interface, including replacements after a USB reset.
+ * The HCI core, like bluetoothd on these machines, uses one controller. */
+enum class BtPipe { Event, AclIn, AclOut, Other };
+static uint64_t g_controller_generation;
+static uint8_t g_hci_interface_number;
+static IOUSBHostInterface *g_bt_interface;
+static IOUSBHostDevice *g_bt_device;
+static IOUSBHostPipe *g_bt_pipes[3];
+static mach_vm_address_t g_orig_copy_pipe;
+
+static BtPipe endpointRole(const StandardUSB::EndpointDescriptor *ed)
 {
-    if (pipe == nullptr) return false;
-    const StandardUSB::EndpointDescriptor *ed = pipe->getEndpointDescriptor();
-    if (ed == nullptr) return false;
-    return (ed->bmAttributes & 0x03) == kIOUSBEndpointTypeBulk &&
-           ed->bEndpointAddress == kBtAclInEndpoint;
+    if (ed != nullptr) {
+        uint8_t type = ed->bmAttributes & 3;
+        bool input = (ed->bEndpointAddress & 0x80) != 0;
+        if (type == kIOUSBEndpointTypeInterrupt && input) return BtPipe::Event;
+        if (type == kIOUSBEndpointTypeBulk) return input ? BtPipe::AclIn : BtPipe::AclOut;
+    }
+    return BtPipe::Other;
 }
 
-/* ACL data to the peer: the Mac's own ATT and L2CAP, bulk OUT endpoint 0x02
- * (broadtek-endpoints shows 0x02 carrying it). The buffer is filled before the
- * transfer, so unlike the IN pipe it can be read in caller context. Used only
- * for the L2CAP trace. */
-static constexpr uint8_t kBtAclOutEndpoint = 0x02;
-static bool isAclOutPipe(IOUSBHostPipe *pipe)
+static void rememberPipe(IOUSBHostInterface *interface, IOUSBHostPipe *pipe)
 {
-    if (pipe == nullptr) return false;
-    const StandardUSB::EndpointDescriptor *ed = pipe->getEndpointDescriptor();
-    if (ed == nullptr) return false;
-    return (ed->bmAttributes & 0x03) == kIOUSBEndpointTypeBulk &&
-           ed->bEndpointAddress == kBtAclOutEndpoint;
+    if (pipe == nullptr) return;
+    BtPipe role = endpointRole(pipe->getEndpointDescriptor());
+    if (role == BtPipe::Other) return;
+    IOUSBHostPipe *old = nullptr;
+    IOSimpleLockLock(g_lock);
+    auto &slot = g_bt_pipes[static_cast<unsigned>(role)];
+    if (interface == g_bt_interface && slot != pipe) {
+        pipe->retain();
+        old = slot;
+        slot = pipe;
+    }
+    IOSimpleLockUnlock(g_lock);
+    if (old != nullptr) old->release();
 }
 
-/* An IN transfer on a pipe of the right type but the wrong address: someone
- * else's traffic, which earlier builds were reading. */
-static bool isOtherDeviceInPipe(IOUSBHostPipe *pipe)
+static IOReturn onCopyPipe(IOUSBHostInterface *interface, uint8_t address, IOUSBHostPipe *&pipe)
 {
-    if (pipe == nullptr) return false;
-    const StandardUSB::EndpointDescriptor *ed = pipe->getEndpointDescriptor();
-    if (ed == nullptr) return false;
-    if ((ed->bEndpointAddress & 0x80) == 0) return false;
-    uint8_t type = static_cast<uint8_t>(ed->bmAttributes & 0x03);
-    if (type != kIOUSBEndpointTypeInterrupt && type != kIOUSBEndpointTypeBulk) return false;
-    return ed->bEndpointAddress != kBtEventEndpoint &&
-           ed->bEndpointAddress != kBtAclInEndpoint;
+    IOReturn result = FunctionCast(onCopyPipe, g_orig_copy_pipe)(interface, address, pipe);
+    if (result == kIOReturnSuccess) rememberPipe(interface, pipe);
+    return result;
+}
+
+static bool onBluetoothInterface(void *, void *, IOService *service, IONotifier *)
+{
+    auto *interface = OSDynamicCast(IOUSBHostInterface, service);
+    if (interface == nullptr) return true;
+    auto *id = interface->getInterfaceDescriptor();
+    auto *config = interface->getConfigurationDescriptor();
+    auto *device = interface->getDevice();
+    if (id == nullptr || config == nullptr || device == nullptr ||
+        id->bInterfaceClass != 0xe0 || id->bInterfaceSubClass != 1 || id->bInterfaceProtocol != 1)
+        return true;
+
+    /* The SCO interface can have the same class triple. Only the primary
+     * HCI interface has the interrupt event and both bulk ACL endpoints. */
+    const StandardUSB::EndpointDescriptor *ed = nullptr;
+    uint8_t addresses[3] = {};
+    while ((ed = StandardUSB::getNextEndpointDescriptor(config, id, ed)) != nullptr) {
+        BtPipe role = endpointRole(ed);
+        if (role != BtPipe::Other) addresses[static_cast<unsigned>(role)] = ed->bEndpointAddress;
+    }
+    if (!addresses[0] || !addresses[1] || !addresses[2]) return true;
+
+    auto *vendor = OSDynamicCast(OSNumber, device->getProperty("idVendor"));
+    bool intel = g_intel_allowed && (g_force_intel || (vendor && vendor->unsigned32BitValue() == 0x8087));
+    IOSimpleLockLock(g_lock);
+    if (g_bt_interface != nullptr) { IOSimpleLockUnlock(g_lock); return true; }
+    interface->retain();
+    device->retain();
+    g_controller_generation++;
+    g_hci_interface_number = id->bInterfaceNumber;
+    g_bt_interface = interface;
+    g_bt_device = device;
+    g_intel = intel;
+    IOSimpleLockUnlock(g_lock);
+    if (auto *platform = IOService::getPlatform()) {
+        platform->setProperty("broadtek-hci-bound", kOSBooleanTrue);
+        platform->setProperty("broadtek-intel", intel ? kOSBooleanTrue : kOSBooleanFalse);
+    }
+    for (uint8_t address : addresses) {
+        if (auto *pipe = interface->copyPipe(address)) {
+            rememberPipe(interface, pipe);
+            pipe->release();
+        }
+    }
+    return true;
+}
+
+static void forgetIntelClient();
+
+static bool onBluetoothTerminated(void *, void *, IOService *service, IONotifier *)
+{
+    IOUSBHostPipe *pipes[3];
+    IOSimpleLockLock(g_lock);
+    if (service != g_bt_interface) { IOSimpleLockUnlock(g_lock); return true; }
+    auto *device = g_bt_device;
+    g_controller_generation++;
+    g_bt_interface = nullptr;
+    g_bt_device = nullptr;
+    g_intel = g_force_intel;
+    bt_adv_reset(&g_adv_state);
+    bt_ctx_init(&g_ctx);
+    memcpy(pipes, g_bt_pipes, sizeof(pipes));
+    bzero(g_bt_pipes, sizeof(g_bt_pipes));
+    IOSimpleLockUnlock(g_lock);
+    forgetIntelClient();
+    for (auto *pipe : pipes) if (pipe != nullptr) pipe->release();
+    if (auto *platform = IOService::getPlatform()) platform->setProperty("broadtek-hci-bound", kOSBooleanFalse);
+    device->release();
+    service->release();
+    return true;
+}
+
+static BtPipe bluetoothPipeRole(IOUSBHostPipe *pipe, uint64_t &generation)
+{
+    if (pipe == nullptr) return BtPipe::Other;
+    IOSimpleLockLock(g_lock);
+    generation = g_controller_generation;
+    BtPipe role = BtPipe::Other;
+    for (unsigned i = 0; i < arrsize(g_bt_pipes); i++)
+        if (g_bt_pipes[i] == pipe) { role = static_cast<BtPipe>(i); break; }
+    IOSimpleLockUnlock(g_lock);
+    return role;
+}
+
+static bool isBluetoothRequest(IOService *client, const StandardUSB::DeviceRequest &request)
+{
+    if (client == nullptr || !isHCICommand(request)) return false;
+    // A user client can be attached to the interface or to its device.
+    IORegistryEntry *entry = client;
+    entry->retain();
+    bool match = false;
+    while (entry != nullptr) {
+        IOSimpleLockLock(g_lock);
+        match = (entry == g_bt_interface || entry == g_bt_device) &&
+                (request.bmRequestType == 0x20 || request.wIndex == g_hci_interface_number);
+        IOSimpleLockUnlock(g_lock);
+        bool stop = match || entry->metaCast("IOUSBHostInterface") || entry->metaCast("IOUSBHostDevice");
+        auto *parent = stop ? nullptr : entry->copyParentEntry(gIOServicePlane);
+        entry->release();
+        entry = parent;
+    }
+    return match;
 }
 
 /* ---- event completions ----------------------------------------------
@@ -1127,6 +1211,8 @@ struct Slot {
     volatile SInt32 busy;
     IOUSBHostCompletion orig;
     IOMemoryDescriptor *md;
+    uint64_t controllerGeneration;
+    uint32_t requestLength;
     SlotKind kind;
     IOMemoryDescriptor *owned;      /* released when the transfer completes */
 };
@@ -1149,6 +1235,16 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
         if (owned != nullptr) owned->release();
         if (orig.action != nullptr)
             orig.action(owner != nullptr ? owner : orig.owner, orig.parameter, status, bytes);
+        return;
+    }
+
+    IOSimpleLockLock(g_lock);
+    bool current = s->controllerGeneration == g_controller_generation;
+    IOSimpleLockUnlock(g_lock);
+    if (!current) {
+        s->md = nullptr;
+        OSDecrementAtomic(&s->busy);
+        if (orig.action != nullptr) orig.action(orig.owner, orig.parameter, status, bytes);
         return;
     }
 
@@ -1190,8 +1286,9 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
     if (status == kIOReturnSuccess && bytes >= 2 && md != nullptr) {
         uint8_t buf[kMaxHCI];
         size_t room = md->getLength();
+        if (room > s->requestLength) room = s->requestLength;
         if (room > kMaxHCI) room = kMaxHCI;
-        size_t len = readMD(md, buf, bytes < kMaxHCI ? bytes : kMaxHCI);
+        size_t len = readMD(md, buf, bytes < room ? bytes : room);
         if (len >= 2) {
             bt_verdict v = BT_FORWARD;
             size_t out = len;
@@ -1203,7 +1300,7 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                 g_n_conn_translated->setValue(g_ctx.conn_translated);
 
             /* Does it even look like an HCI event? */
-            if (static_cast<size_t>(buf[1]) + 2 == len) {
+            if (bytes == len && static_cast<size_t>(buf[1]) + 2 == len) {
                 g_evt_shaped++;
                 if (g_n_evt_shaped != nullptr) g_n_evt_shaped->setValue(g_evt_shaped);
                 noteEventCode(buf[0]);
@@ -1217,24 +1314,31 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                     buf[3] == 0x00)
                     clearL2capHandle((uint16_t)((buf[4] | (buf[5] << 8)) & 0x0fff));
 
-                /* Our own 0x2035's reply. bluetoothd never sends 0x2035, so
-                 * every reply to one is ours. */
-                if (g_adv_addr && buf[0] == 0x0e && len >= 6 && buf[3] == 0x35 &&
-                    buf[4] == 0x20) {
-                    g_adv_inj_status = buf[5];
-                    g_adv_inj_cc++;
-                    if (g_n_adv_inj_cc != nullptr) g_n_adv_inj_cc->setValue(g_adv_inj_cc);
-                    if (g_n_adv_inj_status != nullptr) g_n_adv_inj_status->setValue(buf[5]);
-                    if (g_adv_inj_pending > 0) OSDecrementAtomic(&g_adv_inj_pending);
-                    buf[1] = 0x03; buf[3] = 0x00; buf[4] = 0x00;   /* keep num_packets */
-                    writeMD(md, buf, 5);
-                    deliver = 5;
-                    s->md = nullptr;
-                    OSDecrementAtomic(&s->busy);
-                    if (orig.action != nullptr)
-                        orig.action(owner != nullptr ? owner : orig.owner, orig.parameter,
-                                    status, deliver);
-                    return;
+                /* Consume only a response to an outstanding injected command. */
+                bool cc = buf[0] == 0x0e && len >= 6;
+                bool refused = buf[0] == 0x0f && len >= 6 && buf[2] != 0;
+                if (g_adv_addr && (cc || refused)) {
+                    size_t pos = cc ? 3 : 4;
+                    uint16_t opcode = static_cast<uint16_t>(buf[pos] | (buf[pos + 1] << 8));
+                    uint8_t result = cc ? buf[5] : buf[2];
+                    IOSimpleLockLock(g_lock);
+                    if (result && isAdvOpcode(opcode)) bt_adv_invalidate(&g_adv_state);
+                    bool ours = opcode == 0x2035 && bt_adv_complete(&g_adv_state, result);
+                    IOSimpleLockUnlock(g_lock);
+                    if (ours) {
+                        g_adv_inj_status = result;
+                        g_adv_inj_cc++;
+                        if (g_n_adv_inj_cc != nullptr) g_n_adv_inj_cc->setValue(g_adv_inj_cc);
+                        if (g_n_adv_inj_status != nullptr) g_n_adv_inj_status->setValue(result);
+                        uint8_t credits = cc ? buf[2] : buf[3];
+                        const uint8_t nop[] = { 0x0e, 3, credits, 0, 0 };
+                        deliver = writeEvent(md, nop, sizeof(nop), status);
+                        s->md = nullptr;
+                        OSDecrementAtomic(&s->busy);
+                        if (orig.action != nullptr)
+                            orig.action(owner != nullptr ? owner : orig.owner, orig.parameter, status, deliver);
+                        return;
+                    }
                 }
 
                 /* Intel: link-ready reports, and the replies to our own
@@ -1242,8 +1346,7 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                 if (g_intel) {
                     size_t nl = intelOnEvent(buf, len, room);
                     if (nl != 0) {
-                        writeMD(md, buf, nl);
-                        deliver = static_cast<uint32_t>(nl);
+                        deliver = writeEvent(md, buf, nl, status);
                         s->md = nullptr;
                         OSDecrementAtomic(&s->busy);
                         if (orig.action != nullptr)
@@ -1260,8 +1363,7 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                     buf[3] == 0x05 && buf[4] == 0x20) {
                     OSDecrementAtomic(&g_intel_inj_pending);
                     buf[1] = 0x03; buf[3] = 0x00; buf[4] = 0x00;   /* keep num_packets */
-                    writeMD(md, buf, 5);
-                    deliver = 5;
+                    deliver = writeEvent(md, buf, 5, status);
                     s->md = nullptr;
                     OSDecrementAtomic(&s->busy);
                     if (orig.action != nullptr)
@@ -1282,7 +1384,9 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                 g_evt_other++;
                 if (g_n_evt_other != nullptr) g_n_evt_other->setValue(g_evt_other);
             }
-            if (g_rw_events) {
+            if (g_rw_events && bytes == len && static_cast<size_t>(buf[1]) + 2 == len) {
+                uint8_t original[kMaxHCI];
+                memcpy(original, buf, len);
                 IOSimpleLockLock(g_lock);
                 v = bt_hci_on_event(&g_ctx, buf, len, room, &out);
                 IOSimpleLockUnlock(g_lock);
@@ -1296,9 +1400,8 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                     buf[3] = 0x00; buf[4] = 0x00;
                     out = 5;
                 }
-                if (out != len || v == BT_DROP) writeMD(md, buf, out);
-                else writeMD(md, buf, len);
-                deliver = static_cast<uint32_t>(out);
+                if (out != len || memcmp(original, buf, len) != 0)
+                    deliver = writeEvent(md, buf, out, status);
             }
             OBSLOG(g_logged_evt, "event %02x len %zu%s", buf[0], len,
                    v == BT_DROP ? " (held back)" : "");
@@ -1313,12 +1416,15 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
 }
 
 static IOUSBHostCompletion *borrowSlot(IOUSBHostCompletion *completion, IOMemoryDescriptor *md,
-                                       IOUSBHostCompletion *out, SlotKind kind)
+                                       IOUSBHostCompletion *out, SlotKind kind, uint32_t requestLength,
+                                       uint64_t generation)
 {
     for (int i = 0; i < kSlots; i++) {
         if (OSCompareAndSwap(0, 1, reinterpret_cast<volatile UInt32 *>(&g_slots[i].busy))) {
             g_slots[i].orig = *completion;
             g_slots[i].md = md;
+            g_slots[i].controllerGeneration = generation;
+            g_slots[i].requestLength = requestLength;
             g_slots[i].kind = kind;
             g_slots[i].owned = nullptr;
             out->owner = completion->owner;
@@ -1343,8 +1449,9 @@ static size_t readCommand(StandardUSB::DeviceRequest &request, IOMemoryDescripto
         return 0;
     }
 
+    if (request.wLength < cap) cap = request.wLength;
     size_t len = readMD(md, buf, cap);
-    if (len < 3) {
+    if (len < 3 || len != 3u + buf[2]) {
         g_cmd_short++;
         if (g_n_cmd_short != nullptr) g_n_cmd_short->setValue(g_cmd_short);
         return 0;
@@ -1440,7 +1547,8 @@ static IOReturn onControlRequestAsync(IOUSBHostPipe *that, IOService *forClient,
     noteControl(request);
     {
         uint8_t buf[kMaxHCI];
-        size_t len = readCommand(request, dataBuffer, buf, kMaxHCI);
+        size_t len = isBluetoothRequest(forClient, request)
+            ? readCommand(request, dataBuffer, buf, kMaxHCI) : 0;
         if (len >= 3) {
             uint16_t opcode = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
             g_cmds++; g_cmds_pipe++;
@@ -1472,7 +1580,8 @@ static IOReturn onControlRequestSync(IOUSBHostPipe *that, IOService *forClient,
     noteControl(request);
     {
         uint8_t buf[kMaxHCI];
-        size_t len = readCommand(request, dataBuffer, buf, kMaxHCI);
+        size_t len = isBluetoothRequest(forClient, request)
+            ? readCommand(request, dataBuffer, buf, kMaxHCI) : 0;
         if (len >= 3) {
             uint16_t opcode = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
             g_cmds++; g_cmds_pipe++;
@@ -1592,25 +1701,33 @@ static IOReturn onIOAsync(IOUSBHostPipe *that, IOMemoryDescriptor *dataBuffer,
      * to be able to tell them apart. */
     g_io_calls++;
     if (g_n_io_calls != nullptr) g_n_io_calls->setValue(g_io_calls);
-    if (that != nullptr) noteEndpoint(that->getEndpointDescriptor());
+    uint64_t generation = 0;
+    BtPipe role = bluetoothPipeRole(that, generation);
+    if (role != BtPipe::Other) noteEndpoint(that->getEndpointDescriptor());
 
-    if (completion != nullptr && isEventPipe(that))
-        use = borrowSlot(completion, dataBuffer, &wrapper, kSlotEvent);
-    else if (completion != nullptr && isAclInPipe(that))
-        use = borrowSlot(completion, dataBuffer, &wrapper, kSlotAcl);
-    else if (isAclOutPipe(that) && dataBuffer != nullptr) {
+    if (completion != nullptr && role == BtPipe::Event)
+        use = borrowSlot(completion, dataBuffer, &wrapper, kSlotEvent, dataBufferLength, generation);
+    else if (completion != nullptr && role == BtPipe::AclIn)
+        use = borrowSlot(completion, dataBuffer, &wrapper, kSlotAcl, dataBufferLength, generation);
+    else if (role == BtPipe::AclOut && dataBuffer != nullptr) {
         /* OUT buffer: filled before the transfer, so it reads here. */
         uint8_t acl[16];
         size_t n = readMD(dataBuffer, acl, sizeof(acl));
         if (n >= 8) noteL2cap(0, acl, n);
     }
-    else if (isOtherDeviceInPipe(that)) {
+    else if (that != nullptr && endpointRole(that->getEndpointDescriptor()) != BtPipe::Other) {
         g_pipes_elsewhere++;
         if (g_n_pipes_elsewhere != nullptr) g_n_pipes_elsewhere->setValue(g_pipes_elsewhere);
     }
 
-    return FunctionCast(onIOAsync, g_orig_io_async)(that, dataBuffer, dataBufferLength,
-                                                    use, timeout);
+    IOReturn result = FunctionCast(onIOAsync, g_orig_io_async)(that, dataBuffer, dataBufferLength,
+                                                              use, timeout);
+    if (result != kIOReturnSuccess && use == &wrapper) {
+        auto *slot = static_cast<Slot *>(wrapper.parameter);
+        slot->md = nullptr;
+        OSDecrementAtomic(&slot->busy);
+    }
+    return result;
 }
 
 /* Caller context, bluetoothd's own thread: it may block. */
@@ -1618,19 +1735,24 @@ static void advSendSetAddress(void *that, uint8_t pipeRef, const StandardUSB::De
                               uint8_t handle, uint32_t timeout)
 {
     uint8_t cmd[10] = { 0x35, 0x20, 7, handle };
-    memcpy(&cmd[4], g_adv_rpa, 6);
-    IOMemoryDescriptor *md = ownedCopy(cmd, sizeof(cmd));
-    if (md == nullptr) { g_adv_inj_failed++; return; }
+    IOSimpleLockLock(g_lock);
+    uint64_t ticket = bt_adv_begin(&g_adv_state, handle, g_adv_cache, &cmd[4]);
+    IOSimpleLockUnlock(g_lock);
+    if (!ticket) return;
 
     StandardUSB::DeviceRequest req = like;
     req.wLength = sizeof(cmd);
     uint32_t sent = 0;
-    OSIncrementAtomic(&g_adv_inj_pending);
-    IOReturn r = FunctionCast(onUserClientControlRequest, g_orig_uc_ctrl)(that, pipeRef, req, md,
-                                                                          nullptr, sent, timeout);
-    md->release();
-    if (r != kIOReturnSuccess) {
-        OSDecrementAtomic(&g_adv_inj_pending);
+    IOReturn r = kIOReturnNoMemory;
+    if (auto *md = ownedCopy(cmd, sizeof(cmd))) {
+        r = FunctionCast(onUserClientControlRequest, g_orig_uc_ctrl)(that, pipeRef, req, md,
+                                                                   nullptr, sent, timeout);
+        md->release();
+    }
+    if (r != kIOReturnSuccess || sent != sizeof(cmd)) {
+        IOSimpleLockLock(g_lock);
+        if (g_adv_state.pending == ticket) g_adv_state.pending = 0;
+        IOSimpleLockUnlock(g_lock);
         g_adv_inj_failed++;
         if (g_n_adv_inj_failed != nullptr) g_n_adv_inj_failed->setValue(g_adv_inj_failed);
         return;
@@ -1641,11 +1763,16 @@ static void advSendSetAddress(void *that, uint8_t pipeRef, const StandardUSB::De
     /* One command at a time, as the controller's credit asks: wait for the
      * reply before bluetoothd's enable goes out. A reply that comes late is
      * still turned into a NOP when it arrives. */
-    for (int i = 0; i < 100 && g_adv_inj_pending > 0; i++) IOSleep(1);
-    if (g_adv_inj_pending > 0) {
-        g_adv_inj_timeouts++;
-        if (g_n_adv_inj_timeouts != nullptr) g_n_adv_inj_timeouts->setValue(g_adv_inj_timeouts);
+    for (int i = 0; i <= 100; i++) {
+        IOSimpleLockLock(g_lock);
+        bool waiting = g_adv_state.pending == ticket;
+        if (waiting && i == 100) bt_adv_invalidate(&g_adv_state);
+        IOSimpleLockUnlock(g_lock);
+        if (!waiting) return;
+        if (i < 100) IOSleep(1);
     }
+    g_adv_inj_timeouts++;
+    if (g_n_adv_inj_timeouts != nullptr) g_n_adv_inj_timeouts->setValue(g_adv_inj_timeouts);
 }
 
 /* Caller context. Track 0x2005 and 0x2036; before an enable, address the sets. */
@@ -1658,18 +1785,17 @@ static void advBeforeCommand(void *that, uint8_t pipeRef, const StandardUSB::Dev
     const uint8_t *p = &buf[3];
     if (len < static_cast<size_t>(3) + plen) return;
 
-    if (opcode == 0x2005 && plen >= 6) {
-        memcpy(g_adv_rpa, p, 6);
-        g_adv_have_rpa = true;
-    } else if (opcode == 0x2036 && plen >= 11 && p[0] < 16) {
-        g_adv_random[p[0]] = (p[10] == 0x01);
-    } else if (opcode == 0x2039 && plen >= 2 && p[0] == 0x01 && g_adv_have_rpa) {
-        uint8_t n = p[1];
-        for (uint8_t i = 0; i < n && 2u + 4u * i + 4u <= plen; i++) {
-            uint8_t h = p[2 + 4 * i];
-            if (h < 16 && g_adv_random[h]) advSendSetAddress(that, pipeRef, request, h, timeout);
-        }
+    if (opcode != 0x2039) {
+        IOSimpleLockLock(g_lock);
+        bt_adv_command(&g_adv_state, opcode, p, plen);
+        IOSimpleLockUnlock(g_lock);
+        return;
     }
+    if (plen < 2 || p[0] != 1) return;
+    IOLockLock(g_adv_send_lock);
+    for (unsigned i = 0; i < p[1] && 6u + 4u * i <= plen; i++)
+        advSendSetAddress(that, pipeRef, request, p[2 + 4 * i], timeout);
+    IOLockUnlock(g_adv_send_lock);
 }
 
 /*
@@ -1809,6 +1935,19 @@ static volatile SInt32 g_own_busy;
 static uint64_t g_ready_phy, g_ready_dle, g_ready_real;
 static OSNumber *g_n_ready_phy, *g_n_ready_dle, *g_n_ready_real;
 
+static void forgetIntelClient()
+{
+    if (!g_intel_lock) return;
+    IOSimpleLockLock(g_intel_lock);
+    auto *old = g_uc_client;
+    g_uc_client = nullptr;
+    g_ready_queued = 0;
+    bzero(g_links, sizeof(g_links));
+    g_intel_have_random = false;
+    IOSimpleLockUnlock(g_intel_lock);
+    if (old) old->release();
+}
+
 /* Caller context (bluetoothd's thread). Keeps the client our own commands go
  * through, and holds bluetoothd's command back while one of ours is out, so
  * the controller never has two at once. */
@@ -1851,6 +1990,7 @@ static void intelSendOwn(const uint8_t *cmd, size_t n, uint8_t action, uint16_t 
     uint32_t timeout = g_uc_timeout;
     IOSimpleLockUnlock(g_intel_lock);
     if (client == nullptr) return;
+    if (!isBluetoothRequest(static_cast<IOService *>(client), req)) { client->release(); return; }
 
     OwnReply *slot = nullptr;
     for (auto &o : g_own) if (!o.used) { slot = &o; break; }
@@ -1915,9 +2055,10 @@ static size_t intelOnEvent(uint8_t *buf, size_t len, size_t room)
             uint16_t h = o.handle;
             uint8_t action = o.action;
             o.used = 0;
-            if (action == kOwnToPhy && room >= 8) {
+            if (action == kOwnToPhy && cc && st == 0 && len >= 10 &&
+                (buf[6] | (buf[7] << 8)) == h && room >= 8) {
                 /* Read PHY: status, handle(2), tx, rx */
-                uint8_t tx = (st == 0 && len >= 10) ? buf[8] : 1, rx = (st == 0 && len >= 10) ? buf[9] : 1;
+                uint8_t tx = buf[8], rx = buf[9];
                 const uint8_t ev[8] = { 0x3e, 6, 0x0c, 0x00, static_cast<uint8_t>(h),
                                         static_cast<uint8_t>(h >> 8), tx, rx };
                 memcpy(buf, ev, sizeof(ev));
@@ -1925,7 +2066,8 @@ static size_t intelOnEvent(uint8_t *buf, size_t len, size_t room)
                 if (g_n_ready_phy != nullptr) g_n_ready_phy->setValue(g_ready_phy);
                 return sizeof(ev);
             }
-            if (action == kOwnToDle && room >= 13) {
+            if (action == kOwnToDle && cc && st == 0 && len >= 8 &&
+                (buf[6] | (buf[7] << 8)) == h && room >= 13) {
                 const uint8_t ev[13] = { 0x3e, 11, 0x07, static_cast<uint8_t>(h), static_cast<uint8_t>(h >> 8),
                                          27, 0, 0x48, 0x01, 27, 0, 0x48, 0x01 };
                 memcpy(buf, ev, sizeof(ev));
@@ -2001,7 +2143,8 @@ static IOReturn onUserClientControlRequest(void *that, uint8_t pipeRef,
     noteControl(request);
     {
         uint8_t buf[kMaxHCI];
-        size_t len = readCommand(request, dataBuffer, buf, kMaxHCI);
+        size_t len = isBluetoothRequest(static_cast<IOService *>(that), request)
+            ? readCommand(request, dataBuffer, buf, kMaxHCI) : 0;
         if (len >= 3) {
             uint16_t opcode = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
             g_cmds++; g_cmds_uc++;
@@ -2062,7 +2205,12 @@ static IOReturn onUserClientControlRequest(void *that, uint8_t pipeRef,
 
     /* A synchronous call is finished with the buffer on return. An
      * asynchronous one gave it to a slot, and the trampoline releases it. */
-    if (owned != nullptr && pass == completion) owned->release();
+    if (owned != nullptr && pass == &wrapper && r != kIOReturnSuccess) {
+        auto *slot = static_cast<Slot *>(wrapper.parameter);
+        slot->owned = nullptr;
+        OSDecrementAtomic(&slot->busy);
+    }
+    if (owned != nullptr && (pass == completion || r != kIOReturnSuccess)) owned->release();
 
     return r;
 }
@@ -2084,7 +2232,8 @@ static IOReturn onDeviceRequest(void *that, IOService *forClient,
                                 IOUSBHostCompletion *completion, uint32_t timeout)
 {
     noteControl(request);
-    if (isHCICommand(request) && (descriptor != nullptr || rawBuffer != nullptr)) {
+    if ((descriptor != nullptr || rawBuffer != nullptr) &&
+        isBluetoothRequest(static_cast<IOService *>(that), request)) {
         uint8_t buf[kMaxHCI];
         size_t len = 0;
 
@@ -2126,10 +2275,11 @@ static IOReturn onDeviceRequest(void *that, IOService *forClient,
  * machine while both legacy clients have none. Its four control entry points
  * are hooked together: whether a reply comes back through a completion or by
  * reference makes no difference to reading the command on the way out. */
-static void observeFrameworkCommand(StandardUSB::DeviceRequest &request,
+static void observeFrameworkCommand(void *client, StandardUSB::DeviceRequest &request,
                                     IOMemoryDescriptor *dataBuffer, const char *tag)
 {
     noteControl(request);
+    if (!isBluetoothRequest(static_cast<IOService *>(client), request)) return;
     uint8_t buf[kMaxHCI];
     size_t len = readCommand(request, dataBuffer, buf, kMaxHCI);
     if (len < 3) return;
@@ -2154,7 +2304,7 @@ static IOReturn onFwDeviceRequestAsync(void *that, StandardUSB::DeviceRequest &r
                                        IOMemoryDescriptor *dataBuffer,
                                        IOUSBHostCompletion *completion, uint32_t timeout)
 {
-    observeFrameworkCommand(request, dataBuffer, "fw dev");
+    observeFrameworkCommand(that, request, dataBuffer, "fw dev");
     return FunctionCast(onFwDeviceRequestAsync, g_orig_fw_dev_async)(that, request, dataBuffer,
                                                                      completion, timeout);
 }
@@ -2163,7 +2313,7 @@ static IOReturn onFwDeviceRequestSync(void *that, StandardUSB::DeviceRequest &re
                                       IOMemoryDescriptor *dataBuffer,
                                       uint32_t &bytesTransferred, uint32_t timeout)
 {
-    observeFrameworkCommand(request, dataBuffer, "fw dev sync");
+    observeFrameworkCommand(that, request, dataBuffer, "fw dev sync");
     return FunctionCast(onFwDeviceRequestSync, g_orig_fw_dev_sync)(that, request, dataBuffer,
                                                                    bytesTransferred, timeout);
 }
@@ -2173,7 +2323,7 @@ static IOReturn onFwPipeControlAsync(void *that, uint8_t pipeRef,
                                      IOMemoryDescriptor *dataBuffer,
                                      IOUSBHostCompletion *completion, uint32_t timeout)
 {
-    observeFrameworkCommand(request, dataBuffer, "fw pipe");
+    observeFrameworkCommand(that, request, dataBuffer, "fw pipe");
     return FunctionCast(onFwPipeControlAsync, g_orig_fw_pipe_async)(that, pipeRef, request,
                                                                     dataBuffer, completion,
                                                                     timeout);
@@ -2184,7 +2334,7 @@ static IOReturn onFwPipeControlSync(void *that, uint8_t pipeRef,
                                     IOMemoryDescriptor *dataBuffer,
                                     uint32_t &bytesTransferred, uint32_t timeout)
 {
-    observeFrameworkCommand(request, dataBuffer, "fw pipe sync");
+    observeFrameworkCommand(that, request, dataBuffer, "fw pipe sync");
     return FunctionCast(onFwPipeControlSync, g_orig_fw_pipe_sync)(that, pipeRef, request,
                                                                   dataBuffer, bytesTransferred,
                                                                   timeout);
@@ -2385,22 +2535,14 @@ static void onCsValidatePage(vnode_t vp, memory_object_t pager, memory_object_of
     }
 }
 
-/* gIOMatchedNotification on IOUSBHostDevice: notes an Intel controller. USB
- * enumerates before launchd starts bluetoothd, so this is set before
- * bluetoothd's pages are validated. Only the vendor is looked at: every Intel
- * USB device on a laptop's internal hub is its Bluetooth. */
-static bool onIntelCandidate(void *, void *, IOService *svc, IONotifier *)
+static IOReturn onPowerMessage(void *, void *, UInt32 message, IOService *, void *, vm_size_t)
 {
-    if (svc == nullptr || g_intel) return true;
-    OSNumber *vendor = OSDynamicCast(OSNumber, svc->getProperty("idVendor"));
-    if (vendor == nullptr || vendor->unsigned32BitValue() != 0x8087) return true;
-    g_intel = true;
-    OSNumber *product = OSDynamicCast(OSNumber, svc->getProperty("idProduct"));
-    SYSLOG("broadtek", "Intel Bluetooth 8087:%04x: Intel fixes on",
-           product != nullptr ? product->unsigned32BitValue() : 0);
-    if (IORegistryEntry *platform = IOService::getPlatform())
-        platform->setProperty("broadtek-intel", kOSBooleanTrue);
-    return true;
+    if (message == kIOMessageSystemWillSleep || message == kIOMessageSystemHasPoweredOn) {
+        IOSimpleLockLock(g_lock);
+        bt_adv_invalidate(&g_adv_state);
+        IOSimpleLockUnlock(g_lock);
+    }
+    return kIOReturnSuccess;
 }
 
 void BRTK::init()
@@ -2408,14 +2550,22 @@ void BRTK::init()
     /* An experiment that shares nothing with the HCI path: it hides USB nodes
      * from bluetoothd's dongle test so the LE advertising stack is allowed to
      * start (docs/LE_ADVERTISING.md). Off unless -broadtekclass. */
-    brtkUsbClassInit();
+    bool observe = checkKernelArgument("-broadtekobserve");
+    if (!observe) brtkUsbClassInit();
 
-    g_rw_cmds = checkKernelArgument("-broadtekrw");
-    g_rw_events = g_rw_cmds || checkKernelArgument("-broadtekrwev");
+    g_rw_cmds = !observe && checkKernelArgument("-broadtekrw");
+    g_rw_events = !observe && (g_rw_cmds || checkKernelArgument("-broadtekrwev"));
     /* On by default from 0.2.0 (AirDrop and Handoff need it); -broadtekadvaddroff
      * turns it off. -broadtekadvaddr is still accepted. */
-    g_adv_addr = !checkKernelArgument("-broadtekadvaddroff");
+    g_adv_addr = !observe && !checkKernelArgument("-broadtekadvaddroff");
     g_lock = IOSimpleLockAlloc();
+    if (g_lock == nullptr) return;
+    if (g_adv_addr) {
+        g_adv_send_lock = IOLockAlloc();
+        g_adv_addr = g_adv_send_lock != nullptr;
+        if (g_adv_addr && checkKernelArgument("-broadtekadvcache"))
+            g_adv_cache = registerSleepWakeInterest(onPowerMessage, nullptr) != nullptr;
+    }
     bt_ctx_init(&g_ctx);
     for (int i = 0; i < kSlots; i++) g_slots[i].busy = 0;
 
@@ -2425,10 +2575,11 @@ void BRTK::init()
     markString("broadtek-build", BROADTEK_BUILD);
     markString("broadtek-rewriting", stage);
     mark("broadtek-adv-addr", g_adv_addr);
+    mark("broadtek-adv-cache", g_adv_cache);
 
     /* Intel: on when an Intel Bluetooth device shows up, or always with
      * -broadtekintel; -broadtekinteloff keeps it off. */
-    if (!checkKernelArgument("-broadtekinteloff")) {
+    if (!observe && !checkKernelArgument("-broadtekinteloff")) {
         intelMakeStaticAddress();
         g_n_intel_pages      = makeCounter("broadtek-intel-pages");
         g_n_intel_masked     = makeCounter("broadtek-intel-event-mask");
@@ -2437,16 +2588,11 @@ void BRTK::init()
         g_n_ready_dle        = makeCounter("broadtek-intel-ready-dle");
         g_n_ready_real       = makeCounter("broadtek-intel-ready-real");
         g_intel_lock = IOSimpleLockAlloc();
-        if (!checkKernelArgument("-broadtekreadyoff"))
+        if (g_intel_lock != nullptr && !checkKernelArgument("-broadtekreadyoff"))
             g_ready_call = thread_call_allocate(intelReadyWork, nullptr);
-        if (checkKernelArgument("-broadtekintel")) {
-            g_intel = true;
-            mark("broadtek-intel", true);
-        } else if (IOService::addMatchingNotification(gIOMatchedNotification,
-                       IOService::serviceMatching("IOUSBHostDevice"),
-                       onIntelCandidate, nullptr, nullptr, 0) == nullptr) {
-            SYSLOG("broadtek", "Intel: notifier failed");
-        }
+        g_intel_allowed = g_intel_lock != nullptr;
+        g_force_intel = g_intel_allowed && checkKernelArgument("-broadtekintel");
+        g_intel = g_force_intel;
     }
     g_n_adv_injected     = makeCounter("broadtek-adv-injected");
     g_n_adv_inj_timeouts = makeCounter("broadtek-adv-inj-timeouts");
@@ -2485,9 +2631,14 @@ void BRTK::init()
     g_n_evt_shaped = makeCounter("broadtek-evt-hci-shaped");
     g_n_evt_other  = makeCounter("broadtek-evt-not-hci");
     g_n_btd_pages  = makeCounter("broadtek-btd-pages-patched");
+    mark("broadtek-hci-bound", false);
+    IOService::addMatchingNotification(gIOTerminatedNotification, IOService::serviceMatching("IOUSBHostInterface"),
+                                       onBluetoothTerminated, nullptr, nullptr, 0);
+    IOService::addMatchingNotification(gIOMatchedNotification, IOService::serviceMatching("IOUSBHostInterface"),
+                                       onBluetoothInterface, nullptr, nullptr, 0);
     publishStatus();
 
-    if (!checkKernelArgument("-broadtekadvoff")) {
+    if (!observe && !checkKernelArgument("-broadtekadvoff")) {
         /* Two registrations in one: bluetoothd, which carries the patches, and
          * every process (prefix "/"), which carries none and only counts. If
          * the first count stays at 0 while the second grows, Lilu runs its
@@ -2534,6 +2685,7 @@ void BRTK::installRoutes(KernelPatcher &patcher, size_t id,
     if (g_routed > 0) return;
 
     KernelPatcher::RouteRequest routes[] = {
+        { "__ZN18IOUSBHostInterface13copyPipeGatedEhRP13IOUSBHostPipe", onCopyPipe, g_orig_copy_pipe },
         { "__ZN13IOUSBHostPipe14controlRequestEP9IOServiceRN11StandardUSB13DeviceRequestEP18IOMemoryDescriptorP19IOUSBHostCompletionj",
           onControlRequestAsync, g_orig_ctrl_async },
         { "__ZN13IOUSBHostPipe14controlRequestEP9IOServiceRN11StandardUSB13DeviceRequestEP18IOMemoryDescriptorRjj",
@@ -2589,7 +2741,7 @@ void BRTK::onKextLoad(KernelPatcher &patcher, size_t id, mach_vm_address_t slide
 void BRTK::onPatcherLoad(KernelPatcher &patcher)
 {
     mark("broadtek-patcher-ran", true);
-    if (!checkKernelArgument("-broadtekadvoff") && !g_orig_cs_validate) {
+    if (!checkKernelArgument("-broadtekobserve") && !checkKernelArgument("-broadtekadvoff") && !g_orig_cs_validate) {
         KernelPatcher::RouteRequest route {"_cs_validate_page", onCsValidatePage, g_orig_cs_validate};
 
         if (patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1))

@@ -3,22 +3,23 @@
 # config.plist entry after Lilu, and the boot-arg -broadtekdbg. Run it again
 # to update. Nothing is loaded now; it takes effect at the next restart.
 #
-#   sudo efi/install.sh [--stage off|events|full|classdry|class|advaddr|fulladv] [EFI volume]
+#   sudo efi/install.sh [--stage default|off|events|full|classdry|class|advaddr|fulladv] [EFI volume]
 #
 # The volume is a mounted path, a partition UUID or diskNsM. Without one it
 # finds the volume with OpenCore on it; if there is more than one it asks
 # which. The config as it was before the first install is kept as
 # EFI/OC/config.plist.pre-broadtek. efi/uninstall.sh undoes it.
 #
-# --stage says how much the plugin may change, and defaults to off:
-#   off     observe only, nothing is rewritten (the default)
+# --stage says how much the plugin may change, and defaults to the standard advertising fixes:
+#   default apply the standard advertising fixes
+#   off     observe only, nothing is rewritten
 #   events  rewrite events only: the features rewrite and nothing else
 #   full    rewrite commands as well
 #   advaddr observe, and send each advertising set its private address (0x2035)
 #   fulladv rewrite commands and address the advertising sets: both at once
 set -eu
 
-stage=off
+stage=default
 while [ $# -gt 0 ]; do
     case "$1" in
         --stage) [ $# -ge 2 ] || { echo "--stage needs a value" >&2; exit 1; }
@@ -28,8 +29,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 case "$stage" in
-    off|events|full|classdry|class|advaddr|fulladv) ;;
-    *) echo "unknown stage '$stage': expected off, events, full, classdry, class, advaddr or fulladv" >&2; exit 1 ;;
+    default|off|events|full|classdry|class|advaddr|fulladv) ;;
+    *) echo "unknown stage '$stage': expected default, off, events, full, classdry, class, advaddr or fulladv" >&2; exit 1 ;;
 esac
 
 [ "$(id -u)" = 0 ] || { echo "run with sudo: sudo $0" >&2; exit 1; }
