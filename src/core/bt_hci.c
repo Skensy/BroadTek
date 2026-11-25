@@ -29,6 +29,47 @@
 #define LE_ENH_CONN_COMPLETE  0x0A
 #define LE_EXT_ADV_REPORT     0x0D
 
+unsigned bt_link_procedures(const uint8_t *event, size_t len)
+{
+    /* LE Read Remote Features Complete, followed by eight feature octets. */
+    if (len < 14 || event[0] != EVT_LE_META || event[1] != 12 ||
+        event[2] != 0x04 || event[3] != 0) return 0;
+    return ((event[6] & 0x20) ? BT_LINK_DLE : 0) |
+           ((event[7] & 0x01) ? BT_LINK_PHY : 0);
+}
+
+int bt_link_enable_reports(uint8_t *command, size_t len)
+{
+    if (len < 11 || command[0] != 0x01 || command[1] != 0x20 || command[2] != 8)
+        return 0;
+    if ((command[3] & 0x40) && (command[4] & 0x08)) return 0;
+    command[3] |= 0x40; /* LE Data Length Change */
+    command[4] |= 0x08; /* LE PHY Update Complete */
+    return 1;
+}
+
+size_t bt_link_request(enum bt_link_procedure procedure, uint16_t handle, uint8_t out[10])
+{
+    if (handle > 0x0eff) return 0;
+    /* LE Set PHY, no TX or RX preference. Even an unchanged PHY completes
+     * with a controller-generated PHY Update Complete event (Core, 7.8.49). */
+    const uint8_t phy[] = {0x32, 0x20, 7, 0, 0, 3, 0, 0, 0, 0};
+    /* LE Set Data Length: request 251 octets, 2120 us. The controller alone
+     * reports the negotiated values when the effective lengths change. */
+    const uint8_t dle[] = {0x22, 0x20, 6, 0, 0, 0xfb, 0x00, 0x48, 0x08};
+    const uint8_t *src;
+    size_t n;
+    switch (procedure) {
+    case BT_LINK_PHY: src = phy; n = sizeof(phy); break;
+    case BT_LINK_DLE: src = dle; n = sizeof(dle); break;
+    default: return 0;
+    }
+    for (size_t i = 0; i < n; i++) out[i] = src[i];
+    out[3] = (uint8_t)handle;
+    out[4] = (uint8_t)(handle >> 8);
+    return n;
+}
+
 static void bcopy6(uint8_t *d, const uint8_t *s) { for (int i = 0; i < 6; i++) d[i] = s[i]; }
 static int  beq6(const uint8_t *a, const uint8_t *b)
 {
@@ -327,8 +368,8 @@ enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
             p[4] |= 0x40;                            /* LL Privacy (feature bit 6) */
         if (opcode == OP_READ_LOCAL_COMMANDS && plen >= 68 && p[3] == 0x00) {
             uint8_t *cmds = &p[4];
-            cmds[34] |= 0xe0;                        /* add/remove/clear resolving list */
-            cmds[35] |= 0x1f;                        /* size, read RPAs, enable, timeout */
+            cmds[34] |= 0xf8;                        /* add/remove/clear, size, read peer RPA */
+            cmds[35] |= 0x07;                        /* read local RPA, enable, timeout */
             cmds[39] |= 0x04;                        /* LE Set Privacy Mode */
         }
         return BT_FORWARD;

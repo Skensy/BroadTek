@@ -78,6 +78,32 @@ static void add_to_rl(struct bt_ctx *c)
           "the resolving-list command still goes to the controller");
 }
 
+static void test_realtek_link_setup(void)
+{
+    uint8_t features[] = {0x3e,12,4,0,0x34,2,0xbd,0x79,1,0xf7,0xf9,0xd9,1,2};
+    CHECK(bt_link_procedures(features, sizeof(features)) == (BT_LINK_PHY | BT_LINK_DLE),
+          "the features observed from the iPhone allow both link procedures");
+    CHECK(!bt_link_procedures(features, 13), "truncated feature event");
+    features[7] = 0;
+    CHECK(bt_link_procedures(features, sizeof(features)) == BT_LINK_DLE, "DLE only");
+    features[3] = 1;
+    CHECK(!bt_link_procedures(features, sizeof(features)), "failed remote feature read");
+    uint8_t mask[] = {1,0x20,8,0x81,0x12,1,2,3,4,5,6};
+    const uint8_t expected[] = {1,0x20,8,0xc1,0x1a,1,2,3,4,5,6};
+    CHECK(!bt_link_enable_reports(mask, 10), "truncated event mask");
+    CHECK(bt_link_enable_reports(mask, sizeof(mask)) && !memcmp(mask, expected, sizeof(mask)),
+          "enable only data length and PHY updates");
+    CHECK(!bt_link_enable_reports(mask, sizeof(mask)), "event mask is already enabled");
+    uint8_t cmd[10];
+    const uint8_t phy[] = {0x32,0x20,7,0x34,2,3,0,0,0,0};
+    const uint8_t dle[] = {0x22,0x20,6,0x34,2,0xfb,0,0x48,8};
+    CHECK(bt_link_request(BT_LINK_PHY, 0x234, cmd) == sizeof(phy) && !memcmp(cmd, phy, sizeof(phy)),
+          "Set PHY asks the controller to report its choice");
+    CHECK(bt_link_request(BT_LINK_DLE, 0x234, cmd) == sizeof(dle) && !memcmp(cmd, dle, sizeof(dle)),
+          "Set Data Length requests 251 octets on the live handle");
+    CHECK(!bt_link_request(BT_LINK_PHY, 0xf00, cmd), "reserved connection handle");
+}
+
 static void test_features_rewrite(void)
 {
     /* Command Complete for LE Read Local Supported Features, as the Realtek
@@ -100,10 +126,22 @@ static void test_supported_commands_rewrite(void)
     bt_ctx_init(&c);
     memset(evt, 0, sizeof(evt));
     evt[0] = 0x0e; evt[1] = 68; evt[2] = 1; evt[3] = 0x02; evt[4] = 0x10; evt[5] = 0x00;
+    uint8_t *commands = evt + 6;
+    commands[0] = 0xa5;
+    commands[34] = 0x03;
+    commands[35] = 0x40;
+    commands[39] = 0x80;
+
+    /* Supported Commands from Core, Vol 2, Part E, section 6.27.
+     * The native bitmap above does not implement LE Read Maximum Data
+     * Length or LE Read PHY (octet 35, bits 3 and 4). */
+    uint8_t expected[64] = {0};
+    expected[0] = 0xa5;
+    expected[34] = 0xfb;
+    expected[35] = 0x47;
+    expected[39] = 0x84;
     on_event(&c, evt, sizeof(evt), sizeof(evt), NULL);
-    CHECK((evt[6 + 34] & 0xe0) == 0xe0, "resolving-list command bits (octet 34)");
-    CHECK((evt[6 + 35] & 0x1f) == 0x1f, "resolving-list command bits (octet 35)");
-    CHECK((evt[6 + 39] & 0x04) == 0x04, "LE Set Privacy Mode bit (octet 39)");
+    hexdiff("LE privacy supported commands", commands, expected, sizeof(expected));
 }
 
 static void test_advertising_cache(void)
@@ -707,6 +745,7 @@ int main(void)
     printf("BroadTek core test\n");
     test_aes();
     test_ah();
+    test_realtek_link_setup();
     test_features_rewrite();
     test_supported_commands_rewrite();
     test_advertising_cache();

@@ -104,6 +104,12 @@ enum bt_verdict {
 void bt_aes128_encrypt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
 int  bt_rpa_matches(const uint8_t irk_le[16], const uint8_t rpa_le[6]);
 
+/* Standard HCI link procedures used by the optional RTL8822CU readiness fix. */
+enum bt_link_procedure { BT_LINK_DLE = 1, BT_LINK_PHY = 2 };
+unsigned bt_link_procedures(const uint8_t *event, size_t len);
+int bt_link_enable_reports(uint8_t *command, size_t len);
+size_t bt_link_request(enum bt_link_procedure procedure, uint16_t handle, uint8_t out[10]);
+
 void bt_ctx_init(struct bt_ctx *c);
 
 /* pkt: an HCI command (opcode LE16, plen, params), edited in place. Its length
