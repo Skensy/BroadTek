@@ -13,7 +13,7 @@ CORE      := src/core
 PLUGIN    := src/plugin
 BUILD     := build
 OUT       := $(BUILD)/out
-VERSION   := 0.3.1
+VERSION   := 0.3.2
 
 SDK   := $(shell xcrun --show-sdk-path 2>/dev/null)
 ARCH  := -arch x86_64

@@ -1685,6 +1685,55 @@ exactly like the hooks never firing. The Makefile now passes `-DDEBUG=1` by
 default, and the first 64 commands and 64 events go through `SYSLOG`, which is
 never compiled out, before falling back to `DBGLOG`.
 
+### Instant Hotspot from the Wi-Fi menu, with no key and no helper (2026-11-25)
+
+HONOR HLYL-WFQ9, RTL8822CU, macOS Tahoe 26.7.1, iPhone 16 Pro Max (identity
+`c4:f7:c1:92:93:7a`, public). Picking the iPhone in the Wi-Fi menu timed out
+after ~22 s with `RPErrorDomain -71143`: bluetoothd put the iPhone's public
+identity on the accept list (`fal+/pub/c4:f7:c1:92:93:7a`), the phone
+advertises from an RPA, and there is no IRK for it on this Mac (above).
+
+**First proof, with the log join.** `tools/map_install` joins the kext's
+air-side (RPA <-> NearbyInfo tag) to bluetoothd's `Identities resolve added:
+Addr ..., AT ...` line. It had never run on this machine, and it had a bug that
+would have stopped it here: it guessed the identity's type from the top bits,
+and `c4:...` looks static-random, so the mapping went in as type 1 and never
+matched bluetoothd's type-0 add. It now takes the type from
+`broadtek-conn-targets`. With it running, at 10:32 the click went through:
+Mac-initiated LE link, `com.sharing.hotspot.request` sent over BLE, `Request
+complete: success`, association to the hotspot in 7.0 s. At 10:36, with the
+phone's hotspot on 2.4 GHz ("Maximize Compatibility"), `en0` got
+`172.20.10.2` and traffic flowed through the phone.
+
+**Then without the log: guess and prove, in the kext (0.3.2).** bluetoothd
+encrypts the link with the identity's bond key ~160 ms after it connects
+(`Encryption is now enabled for device ... Public C4:F7:C1:92:93:7A`). Only
+the real device holds that key, so the controller's Encryption Change is a
+proof of who is at the other end. `src/core/bt_hci.c`, "Guessing and
+proving":
+
+- candidates: every RPA advertising Apple NearbyInfo, with RSSI, connectable
+  flag, first/last heard;
+- on bluetoothd's accept-list add for an identity with no key and no proven
+  address, the likeliest candidate is **added beside** the identity (an
+  injected 0x2011, its Command Complete turned into a NOP) -- never in its
+  place, so a non-Apple peripheral keeps its own entry;
+- the link that forms is reported as the identity; Encryption Change success
+  proves the address, failure or a disconnect before encryption rejects it,
+  and at the next accept-list connection attempt the rejected guess is swapped
+  for the next candidate;
+- a proven address is then substituted like a resolved one; when it stops
+  advertising (rotation) the candidate that appeared as it went quiet is tried
+  first;
+- an identity that fails three guesses and never proves one is left alone.
+
+Counters: `broadtek-guessing`, `-guesses`, `-guess-proven`,
+`-guess-rejected`, `-guess-stale`, `-guess-cmds-sent/-failed/-timeouts`,
+`-guess-last-status`. Off with `-broadtekguessoff`; needs `-broadtekrw`.
+
+**Still open:** a hotspot on 5 GHz (channel 44) associates but DHCP never
+starts on `en0`; that is AirPort_RTW88, not Bluetooth.
+
 ## 7. Where it stands
 
 - Phase 0 is **observe-only**: without `-broadtekrw` the plugin changes

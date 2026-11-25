@@ -723,6 +723,192 @@ static void test_install_map(void)
     hexdiff("and must leave that report alone", &rpt[6], other, 6);
 }
 
+/* ---- Guessing and proving ---------------------------------------------- */
+
+/* One LE Extended Advertising Report from a connectable RPA, carrying Apple
+ * NearbyInfo (or not), as the RTL8822CU delivers them. */
+static void advertise(struct bt_ctx *c, const uint8_t addr[6], int8_t rssi, int nearby)
+{
+    uint8_t data[] = {0x02, 0x01, 0x1a,
+                      0x0a, 0xff, 0x4c, 0x00, 0x10, 0x05, 0x01, 0x98, 0xaa, 0xbb, 0xcc};
+    if (!nearby) data[7] = 0x07;                       /* proximity pairing instead */
+    uint8_t ev[2 + 1 + 1 + 24 + sizeof(data)];
+    memset(ev, 0, sizeof(ev));
+    ev[0] = 0x3e; ev[1] = (uint8_t)(sizeof(ev) - 2); ev[2] = 0x0d; ev[3] = 1;
+    uint8_t *r = &ev[4];
+    r[0] = 0x13; r[1] = 0x00; r[2] = 0x01;              /* connectable legacy, random */
+    memcpy(&r[3], addr, 6);
+    r[9] = 1; r[10] = 0; r[11] = 0xff; r[12] = 0x7f; r[13] = (uint8_t)rssi;
+    r[23] = sizeof(data);
+    memcpy(&r[24], data, sizeof(data));
+    size_t out;
+    bt_hci_on_event(c, ev, sizeof(ev), sizeof(ev), &out);
+}
+
+static void connected(struct bt_ctx *c, const uint8_t rpa[6], uint16_t handle, uint8_t got_id[6])
+{
+    uint8_t ev[] = {0x3e, 0x13, 0x01, 0x00, (uint8_t)handle, (uint8_t)(handle >> 8), 0x00, 0x01,
+                    0,0,0,0,0,0, 0x18,0x00, 0x00,0x00, 0x48,0x00, 0x00};
+    memcpy(&ev[8], rpa, 6);
+    size_t out;
+    bt_hci_on_event(c, ev, sizeof(ev), sizeof(ev), &out);
+    memcpy(got_id, &ev[8], 6);
+}
+
+static void encrypted(struct bt_ctx *c, uint16_t handle, uint8_t status)
+{
+    uint8_t ev[] = {0x08, 0x04, status, (uint8_t)handle, (uint8_t)(handle >> 8), status ? 0 : 1};
+    size_t out;
+    bt_hci_on_event(c, ev, sizeof(ev), sizeof(ev), &out);
+}
+
+static void disconnected(struct bt_ctx *c, uint16_t handle)
+{
+    uint8_t ev[] = {0x05, 0x04, 0x00, (uint8_t)handle, (uint8_t)(handle >> 8), 0x16};
+    size_t out;
+    bt_hci_on_event(c, ev, sizeof(ev), sizeof(ev), &out);
+}
+
+static void fal_command(uint8_t *cmd, uint16_t op, uint8_t type, const uint8_t addr[6])
+{
+    cmd[0] = (uint8_t)op; cmd[1] = (uint8_t)(op >> 8); cmd[2] = 7; cmd[3] = type;
+    memcpy(&cmd[4], addr, 6);
+}
+
+static int injected_is(const struct bt_inject *in, int i, uint16_t op, const uint8_t addr[6])
+{
+    uint8_t want[10];
+    fal_command(want, op, 0x01, addr);
+    return in->n > i && !memcmp(in->cmd[i], want, 10);
+}
+
+static void test_guess_and_prove(void)
+{
+    /* HCI byte order: the last byte carries the address type bits. */
+    const uint8_t phone_id[6] = {0x7a, 0x93, 0x92, 0xc1, 0xf7, 0xc4};
+    const uint8_t watch[6] = {0xe7, 0xb8, 0xb4, 0x9f, 0x7f, 0x4f};
+    const uint8_t phone[6] = {0xb6, 0x14, 0xd0, 0x1d, 0x2d, 0x60};
+    const uint8_t phone2[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x52};
+    const uint8_t loud[6] = {0x09, 0x08, 0x07, 0x06, 0x05, 0x44};
+    const uint8_t airpods[6] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x56};
+    struct bt_ctx c;
+    struct bt_inject in;
+    uint8_t cmd[10], id[6];
+
+    bt_ctx_init(&c);
+    c.guessing = 1;
+    c.now = 1000;
+    advertise(&c, watch, -40, 1);            /* the Watch is louder than the phone */
+    advertise(&c, phone, -60, 1);
+    advertise(&c, airpods, -20, 0);          /* no NearbyInfo: never a candidate */
+
+    /* bluetoothd puts the identity on the accept list. The likeliest
+     * candidate goes on beside it; the identity itself is left alone. */
+    fal_command(cmd, 0x2011, 0x00, phone_id);
+    bt_guess_before_command(&c, cmd, sizeof(cmd), &in);
+    CHECK(in.n == 1 && injected_is(&in, 0, 0x2011, watch), "the loudest candidate goes on first");
+    bt_hci_on_command(&c, cmd, sizeof(cmd));
+    CHECK(cmd[3] == 0x00 && !memcmp(&cmd[4], phone_id, 6), "a guess never replaces the identity");
+    CHECK(c.guesses == 1, "one guess counted");
+
+    uint8_t create[3 + 25] = {0x0d, 0x20, 25, 0x60, 0, 0x60, 0, 0x01};
+    bt_guess_before_command(&c, create, sizeof(create), &in);
+    CHECK(in.n == 0, "nothing to swap while the guess is untested");
+
+    /* It connects to the Watch, reported as the phone; the phone's key fails. */
+    connected(&c, watch, 0x40, id);
+    hexdiff("a guessed link is reported as the identity", id, phone_id, 6);
+    encrypted(&c, 0x40, 0x06);
+    CHECK(c.rejected == 1, "a failed encryption disproves the guess");
+    disconnected(&c, 0x40);
+
+    /* bluetoothd tries again: the disproven guess comes off, the next goes on. */
+    bt_guess_before_command(&c, create, sizeof(create), &in);
+    CHECK(in.n == 2 && injected_is(&in, 0, 0x2012, watch) && injected_is(&in, 1, 0x2011, phone),
+          "the failed guess is swapped for the next candidate (n=%u)", in.n);
+
+    connected(&c, phone, 0x41, id);
+    hexdiff("the phone's link is reported as the identity", id, phone_id, 6);
+    encrypted(&c, 0x41, 0x00);
+    CHECK(c.proven == 1, "a link that encrypts proves the address");
+
+    /* The removal takes exactly the injected entry off again. */
+    fal_command(cmd, 0x2012, 0x00, phone_id);
+    bt_guess_before_command(&c, cmd, sizeof(cmd), &in);
+    CHECK(in.n == 1 && injected_is(&in, 0, 0x2012, phone), "the injected entry comes off with it");
+    bt_hci_on_command(&c, cmd, sizeof(cmd));
+    CHECK(cmd[3] == 0x00, "bluetoothd's own removal is untouched");
+    disconnected(&c, 0x41);
+    CHECK(c.rejected == 1, "a proven link going down disproves nothing");
+
+    /* Proven now: the next add carries the address in the identity's place,
+     * exactly as a key would, and the removal names the same address. */
+    c.now = 5000;
+    advertise(&c, phone, -58, 1);
+    fal_command(cmd, 0x2011, 0x00, phone_id);
+    bt_guess_before_command(&c, cmd, sizeof(cmd), &in);
+    CHECK(in.n == 0, "no guessing once proven");
+    bt_hci_on_command(&c, cmd, sizeof(cmd));
+    CHECK(cmd[3] == 0x01 && !memcmp(&cmd[4], phone, 6), "a proven address is substituted");
+    fal_command(cmd, 0x2012, 0x00, phone_id);
+    bt_hci_on_command(&c, cmd, sizeof(cmd));
+    CHECK(cmd[3] == 0x01 && !memcmp(&cmd[4], phone, 6), "and removed by the same address");
+
+    /* Rotation: the phone goes quiet and a new address appears as it does.
+     * A louder stranger is around too; the successor still wins. */
+    c.now = 14500; advertise(&c, phone, -58, 1);
+    c.now = 15000; advertise(&c, phone2, -61, 1);
+    c.now = 20000; advertise(&c, loud, -30, 1); advertise(&c, watch, -40, 1);
+    c.now = 50000; advertise(&c, phone2, -61, 1); advertise(&c, loud, -30, 1);
+    fal_command(cmd, 0x2011, 0x00, phone_id);
+    bt_guess_before_command(&c, cmd, sizeof(cmd), &in);
+    CHECK(c.stale == 1, "the silent proven address is dropped");
+    CHECK(in.n == 1 && injected_is(&in, 0, 0x2011, phone2), "the successor is tried first");
+    bt_hci_on_command(&c, cmd, sizeof(cmd));
+    CHECK(cmd[3] == 0x00, "and stands beside the identity, unproven");
+}
+
+/* A peripheral that is not an Apple device must keep its own accept-list
+ * entry, and stop being guessed for once guesses keep failing. */
+static void test_guess_gives_up(void)
+{
+    const uint8_t mouse[6] = {0x01, 0x00, 0x00, 0xaa, 0xbb, 0x0c};
+    uint8_t rpa[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    struct bt_ctx c;
+    struct bt_inject in;
+    uint8_t cmd[10], id[6];
+    uint8_t create[3 + 25] = {0x0d, 0x20, 25, 0x60, 0, 0x60, 0, 0x01};
+
+    bt_ctx_init(&c);
+    c.guessing = 1;
+    c.now = 100;
+    for (int i = 0; i < 6; i++) { rpa[0] = (uint8_t)i; advertise(&c, rpa, (int8_t)(-30 - i), 1); }
+
+    fal_command(cmd, 0x2011, 0x00, mouse);
+    bt_guess_before_command(&c, cmd, sizeof(cmd), &in);
+    bt_hci_on_command(&c, cmd, sizeof(cmd));
+    CHECK(!memcmp(&cmd[4], mouse, 6), "the mouse stays on its own accept-list entry");
+    for (int round = 0; round < 5; round++) {
+        uint8_t now[6];
+        memcpy(now, c.rl[0].rpa, 6);
+        if (!c.rl[0].have_rpa) break;
+        connected(&c, now, (uint16_t)(0x50 + round), id);
+        encrypted(&c, (uint16_t)(0x50 + round), 0x06);
+        disconnected(&c, (uint16_t)(0x50 + round));
+        bt_guess_before_command(&c, create, sizeof(create), &in);
+    }
+    CHECK(c.rejected == 3, "three wrong guesses and no more (got %u)", c.rejected);
+    CHECK(in.n == 1 && in.cmd[0][0] == 0x12, "the last guess comes off and nothing replaces it");
+
+    /* Off, nothing at all. */
+    struct bt_ctx z;
+    bt_ctx_init(&z);
+    advertise(&z, rpa, -30, 1);
+    fal_command(cmd, 0x2011, 0x00, mouse);
+    bt_guess_before_command(&z, cmd, sizeof(cmd), &in);
+    CHECK(in.n == 0 && z.cand[0].used == 0, "guessing off: no candidates, no commands");
+}
+
 /* The list is finite and must refuse rather than overflow. */
 static void test_install_full(void)
 {
@@ -762,6 +948,8 @@ int main(void)
     test_promote();
     test_install_full();
     test_install_map();
+    test_guess_and_prove();
+    test_guess_gives_up();
     if (fails) { printf("%d failure(s)\n", fails); return 1; }
     printf("all checks passed\n");
     return 0;

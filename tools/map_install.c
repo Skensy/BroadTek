@@ -179,6 +179,46 @@ static int readIdentities(struct pair *out, int max)
     return n;
 }
 
+/* ---- the identity's address type --------------------------------------- */
+
+/* The type the kext matches on is the one bluetoothd puts on the accept list,
+ * which the kext publishes in broadtek-conn-targets ("fal+/pub/c4:f7:..."). It
+ * cannot be read off the address bits: a public address is a vendor OUI and
+ * may start with anything, so c4:f7:c1:... -- an iPhone 16 Pro Max's public
+ * identity -- looks like a static random address by its top two bits. Taking
+ * that guess installed the mapping under type 1, rl_find() looked under type 0
+ * and nothing was ever substituted.
+ *
+ * Returns 0 (public) or 1 (random), or -1 if the kext has not seen bluetoothd
+ * use this identity yet. */
+static int identityType(const uint8_t addr[6])
+{
+    io_registry_entry_t root = IORegistryGetRootEntry(kIOMainPortDefault);
+    if (root == IO_OBJECT_NULL) return -1;
+    CFTypeRef prop = IORegistryEntrySearchCFProperty(root, kIOServicePlane,
+                                                     CFSTR("broadtek-conn-targets"),
+                                                     kCFAllocatorDefault,
+                                                     kIORegistryIterateRecursively);
+    IOObjectRelease(root);
+    if (prop == NULL) return -1;
+
+    char text[2048] = {0};
+    int ok = CFGetTypeID(prop) == CFStringGetTypeID() &&
+             CFStringGetCString(prop, text, sizeof(text), kCFStringEncodingUTF8);
+    CFRelease(prop);
+    if (!ok) return -1;
+
+    char want[18];
+    snprintf(want, sizeof(want), "%02x:%02x:%02x:%02x:%02x:%02x",
+             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+    for (char *at = strstr(text, want); at != NULL; at = strstr(at + 1, want)) {
+        if (at - text < 4) continue;
+        if (strncmp(at - 4, "pub/", 4) == 0) return 0;
+        if (strncmp(at - 4, "rnd/", 4) == 0) return 1;
+    }
+    return -1;
+}
+
 /* ---- the install ------------------------------------------------------- */
 
 static int install(const uint8_t *blob)
@@ -241,7 +281,9 @@ static int runOnce(int quiet)
             if (memcmp(ident[i].addr, air[j].addr, 6) == 0) continue;
 
             uint8_t blob[MAP_BLOB_LEN] = {0};
-            blob[0] = (ident[i].addr[0] & 0xc0) == 0xc0 ? 0x01 : 0x00;
+            int type = identityType(ident[i].addr);
+            if (type < 0) type = (ident[i].addr[0] & 0xc0) == 0xc0 ? 0x01 : 0x00;
+            blob[0] = (uint8_t)type;
             for (int k = 0; k < 6; k++) blob[1 + k] = ident[i].addr[5 - k];
             for (int k = 0; k < 6; k++) blob[7 + k] = air[j].addr[5 - k];
 

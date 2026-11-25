@@ -8,6 +8,7 @@
 #define OP_READ_LOCAL_COMMANDS   OP(0x04, 0x002)
 #define OP_LE_READ_FEATURES      OP(0x08, 0x003)
 #define OP_LE_CREATE_CONN        OP(0x08, 0x00D)
+#define OP_LE_CLEAR_FAL          OP(0x08, 0x010)
 #define OP_LE_ADD_FAL            OP(0x08, 0x011)
 #define OP_LE_DEL_FAL            OP(0x08, 0x012)
 #define OP_LE_ADD_RL             OP(0x08, 0x027)
@@ -21,6 +22,10 @@
 #define OP_LE_EXT_CREATE_CONN    OP(0x08, 0x043)
 #define OP_LE_SET_PRIVACY_MODE   OP(0x08, 0x04E)
 
+#define EVT_DISCONN_COMPLETE  0x05
+#define EVT_ENCRYPT_CHANGE    0x08
+#define EVT_KEY_REFRESH       0x30
+#define EVT_ENCRYPT_CHANGE_V2 0x59
 #define EVT_CMD_COMPLETE      0x0E
 #define EVT_CMD_STATUS        0x0F
 #define EVT_LE_META           0x3E
@@ -140,16 +145,273 @@ static struct bt_pending *take_pending(struct bt_ctx *c, uint16_t opcode)
 
 /* The address the controller should really be told about: an identity address
  * BroadTek has an IRK and a current RPA for is replaced by that RPA, so the
- * controller's own accept list and connection attempts work unchanged. */
+ * controller's own accept list and connection attempts work unchanged.
+ *
+ * Never a guess: an address that has not been proven stands *beside* the
+ * identity on the accept list (bt_guess_before_command), never in its place,
+ * so a wrong guess cannot lock the real device out. */
 static int substitute(struct bt_ctx *c, uint8_t *type, uint8_t *addr)
 {
     struct bt_rl_entry *e = rl_find(c, *type, addr);
 
-    if (e == NULL || !e->have_rpa) return 0;
+    if (e == NULL || !e->have_rpa || e->guess) return 0;
     *type = 0x01;                            /* random */
     bcopy6(addr, e->rpa);
     c->substituted++;
     return 1;
+}
+
+/* ---- Guessing and proving ------------------------------------------------
+ *
+ * The iPhone has no IRK on this Mac (docs/STATE.md), so nothing here can
+ * derive its current private address. macOS recognises it from the NearbyInfo
+ * tag, but that join happens inside bluetoothd and only reaches the outside
+ * as a log line. What BroadTek *can* see is enough to do without it:
+ *
+ *   - every private address an Apple device is advertising NearbyInfo from,
+ *     with its signal strength and when it appeared (the candidates);
+ *   - bluetoothd encrypting the link with the identity's own bond key the
+ *     moment it connects, and the controller reporting whether that worked.
+ *
+ * Only the device that owns the identity holds that key, so the encryption
+ * result is a proof: a link to the wrong device fails to encrypt, and the
+ * right one succeeds. So when bluetoothd asks for an identity BroadTek has no
+ * address for, the likeliest candidate is put on the accept list next to it;
+ * the encryption result then confirms it (and later accept-list adds carry it
+ * in the identity's place, as with a key) or rejects it, and the next
+ * candidate gets its turn. When the proven address rotates, the address that
+ * appears as it goes quiet is tried first.
+ *
+ * An identity that never proves anything -- a non-Apple peripheral asking to
+ * be reconnected -- stops being guessed for after BT_GUESS_GIVE_UP failures,
+ * and since its own address was never taken off the accept list, it was able
+ * to connect throughout. */
+
+#define BT_GUESS_GIVE_UP 3
+
+static int fresh(const struct bt_ctx *c, uint32_t t, uint32_t window)
+{
+    return (uint32_t)(c->now - t) <= window;
+}
+
+/* Apple's manufacturer data (4c 00) carrying a NearbyInfo record (0x10). */
+static int has_nearby_info(const uint8_t *d, size_t n)
+{
+    size_t off = 0;
+    while (off + 2 <= n) {
+        uint8_t adlen = d[off];
+        if (adlen == 0 || off + 1 + adlen > n) return 0;
+        if (d[off + 1] == 0xff && adlen >= 4 && d[off + 2] == 0x4c && d[off + 3] == 0x00) {
+            size_t s = off + 4, end = off + 1 + adlen;
+            while (s + 2 <= end) {
+                if (s + 2 + d[s + 1] > end) break;
+                if (d[s] == 0x10) return 1;
+                s += 2u + d[s + 1];
+            }
+        }
+        off += 1u + adlen;
+    }
+    return 0;
+}
+
+static struct bt_candidate *cand_find(struct bt_ctx *c, const uint8_t *addr)
+{
+    for (int i = 0; i < BT_CAND_MAX; i++)
+        if (c->cand[i].used && beq6(c->cand[i].addr, addr)) return &c->cand[i];
+    return NULL;
+}
+
+static void note_candidate(struct bt_ctx *c, int connectable, uint8_t type,
+                           const uint8_t *addr, const uint8_t *data, size_t dlen, int8_t rssi)
+{
+    if (!c->guessing || type != 0x01 || (addr[5] & 0xc0) != 0x40) return;
+    if (!has_nearby_info(data, dlen)) return;
+
+    struct bt_candidate *k = cand_find(c, addr);
+    if (k == NULL) {
+        for (int i = 0; i < BT_CAND_MAX && k == NULL; i++)
+            if (!c->cand[i].used) k = &c->cand[i];
+        if (k == NULL) {                     /* full: the longest silent goes */
+            k = &c->cand[0];
+            for (int i = 1; i < BT_CAND_MAX; i++)
+                if ((uint32_t)(c->now - c->cand[i].seen) > (uint32_t)(c->now - k->seen))
+                    k = &c->cand[i];
+        }
+        k->used = 1;
+        k->connectable = 0;
+        bcopy6(k->addr, addr);
+        k->first_seen = c->now;
+    }
+    k->seen = c->now;
+    k->rssi = rssi == 127 ? -127 : rssi;     /* 127: not available */
+    if (connectable) k->connectable = 1;
+
+    for (int i = 0; i < BT_RL_SIZE; i++)
+        if (c->rl[i].valid && c->rl[i].have_rpa && beq6(c->rl[i].rpa, addr))
+            c->rl[i].rpa_seen = c->now;
+}
+
+static int rejected_for(const struct bt_rl_entry *e, const uint8_t *addr)
+{
+    for (int i = 0; i < e->n_rejected && i < BT_REJECT_MAX; i++)
+        if (beq6(e->rejected[i], addr)) return 1;
+    return 0;
+}
+
+/* Some other identity already holds this address, guessed or proven. */
+static int taken(const struct bt_ctx *c, const struct bt_rl_entry *e, const uint8_t *addr)
+{
+    for (int i = 0; i < BT_RL_SIZE; i++)
+        if (&c->rl[i] != e && c->rl[i].valid && c->rl[i].have_rpa && beq6(c->rl[i].rpa, addr))
+            return 1;
+    return 0;
+}
+
+static struct bt_candidate *pick(struct bt_ctx *c, struct bt_rl_entry *e)
+{
+    struct bt_candidate *best = NULL;
+    int best_score = 0;
+
+    for (int i = 0; i < BT_CAND_MAX; i++) {
+        struct bt_candidate *k = &c->cand[i];
+        if (!k->used || !fresh(c, k->seen, BT_CAND_FRESH_MS)) continue;
+        if (rejected_for(e, k->addr) || taken(c, e, k->addr)) continue;
+
+        int score = 128 + k->rssi;            /* 1..148: louder is likelier */
+        if (k->connectable) score += 1000;    /* it can be connected to at all */
+        if (e->proven) {
+            /* The address that appeared as the proven one went quiet. */
+            int32_t d = (int32_t)(k->first_seen - e->rpa_seen);
+            if (d >= -5000 && d <= (int32_t)BT_SUCCESSOR_MS)
+                score += 4000 - (d < 0 ? -d : d) / 10;   /* the nearest in time wins */
+        }
+        if (best == NULL || score > best_score) { best = k; best_score = score; }
+    }
+    return best;
+}
+
+static void reject(struct bt_ctx *c, struct bt_rl_entry *e)
+{
+    if (e->n_rejected >= BT_REJECT_MAX) {
+        for (int i = 1; i < BT_REJECT_MAX; i++) bcopy6(e->rejected[i - 1], e->rejected[i]);
+        e->n_rejected = BT_REJECT_MAX - 1;
+    }
+    bcopy6(e->rejected[e->n_rejected++], e->rpa);
+    if (!e->proven && e->fails < 255) e->fails++;
+    e->have_rpa = 0;
+    e->guess = 0;
+    c->rejected++;
+}
+
+/* A proven or handed-down address that has stopped advertising has rotated
+ * away. Only an address the candidate table has actually heard can be judged:
+ * one it never saw is left as it is. */
+static void refresh(struct bt_ctx *c, struct bt_rl_entry *e)
+{
+    if (!c->guessing || !e->have_rpa || e->have_irk || e->guess) return;
+    struct bt_candidate *k = cand_find(c, e->rpa);
+    if (k == NULL || fresh(c, k->seen, BT_CAND_FRESH_MS)) return;
+    e->rpa_seen = k->seen;
+    e->have_rpa = 0;
+    c->stale++;
+}
+
+static int identity_shaped(uint8_t type, const uint8_t *addr)
+{
+    if (type == 0x00) return 1;                          /* public */
+    return type == 0x01 && (addr[5] & 0xc0) == 0xc0;     /* static random */
+}
+
+static size_t fal_cmd(uint8_t *out, uint16_t op, const uint8_t *addr)
+{
+    out[0] = (uint8_t)op; out[1] = (uint8_t)(op >> 8); out[2] = 7; out[3] = 0x01;
+    bcopy6(&out[4], addr);
+    return 10;
+}
+
+static void emit(struct bt_inject *out, uint16_t op, const uint8_t *addr)
+{
+    if (out->n < BT_INJECT_MAX) fal_cmd(out->cmd[out->n++], op, addr);
+}
+
+/* Guess for this entry and put the guess on the accept list beside it. */
+static void guess_onto_fal(struct bt_ctx *c, struct bt_rl_entry *e, struct bt_inject *out)
+{
+    if (e->fails >= BT_GUESS_GIVE_UP || out->n >= BT_INJECT_MAX) return;
+    struct bt_candidate *k = pick(c, e);
+    if (k == NULL) return;
+    bcopy6(e->rpa, k->addr);
+    e->have_rpa = 1;
+    e->guess = 1;
+    e->rpa_seen = k->seen;
+    c->guesses++;
+    emit(out, OP_LE_ADD_FAL, e->rpa);
+    e->fal_inj = 1;
+    bcopy6(e->fal_inj_rpa, e->rpa);
+}
+
+void bt_guess_before_command(struct bt_ctx *c, const uint8_t *pkt, size_t len,
+                             struct bt_inject *out)
+{
+    out->n = 0;
+    if (!c->guessing || len < 3) return;
+    uint16_t opcode = (uint16_t)(pkt[0] | (pkt[1] << 8));
+    uint8_t plen = pkt[2];
+    const uint8_t *p = &pkt[3];
+    if (len < (size_t)3 + plen) return;
+
+    switch (opcode) {
+    case OP_LE_ADD_FAL: {
+        if (plen < 7 || !identity_shaped(p[0], &p[1])) return;
+        struct bt_rl_entry *e = rl_find(c, p[0], &p[1]);
+        if (e != NULL && (e->have_irk || e->fal_inj)) return;
+        if (e != NULL) refresh(c, e);
+        if (e != NULL && e->have_rpa) return;          /* substitute() has it */
+        if (e == NULL) {
+            for (int i = 0; i < BT_RL_SIZE && e == NULL; i++)
+                if (!c->rl[i].valid) e = &c->rl[i];
+            if (e == NULL) return;
+            uint8_t *z = (uint8_t *)e;
+            for (size_t i = 0; i < sizeof(*e); i++) z[i] = 0;
+            e->valid = 1;
+            e->id_type = p[0] & 1;
+            bcopy6(e->id_addr, &p[1]);
+        }
+        guess_onto_fal(c, e, out);
+        return;
+    }
+    case OP_LE_DEL_FAL: {
+        if (plen < 7) return;
+        struct bt_rl_entry *e = rl_find(c, p[0], &p[1]);
+        if (e == NULL || !e->fal_inj) return;
+        emit(out, OP_LE_DEL_FAL, e->fal_inj_rpa);
+        e->fal_inj = 0;
+        return;
+    }
+    case OP_LE_CLEAR_FAL:
+        for (int i = 0; i < BT_RL_SIZE; i++) { c->rl[i].fal_inj = 0; c->rl[i].fal_sub = 0; }
+        return;
+    case OP_LE_CREATE_CONN:
+    case OP_LE_EXT_CREATE_CONN: {
+        /* Accept-list initiation only. A guess that was disproven since it
+         * went on the list is swapped for the next candidate now, so this
+         * attempt does not reconnect to the device that just failed. */
+        uint8_t policy = opcode == OP_LE_CREATE_CONN ? (plen >= 5 ? p[4] : 0) : (plen >= 1 ? p[0] : 0);
+        if (policy != 1) return;
+        for (int i = 0; i < BT_RL_SIZE; i++) {
+            struct bt_rl_entry *e = &c->rl[i];
+            if (!e->valid || !e->fal_inj) continue;
+            if (e->have_rpa && beq6(e->rpa, e->fal_inj_rpa)) continue;
+            if (out->n + 2 > BT_INJECT_MAX) break;
+            emit(out, OP_LE_DEL_FAL, e->fal_inj_rpa);
+            e->fal_inj = 0;
+            if (!e->have_rpa) guess_onto_fal(c, e, out);
+        }
+        return;
+    }
+    default:
+        return;
+    }
 }
 
 /* Put an identity and its IRK into the resolving list, replacing any entry
@@ -278,10 +540,30 @@ enum bt_verdict bt_hci_on_command(struct bt_ctx *c, uint8_t *pkt, size_t len)
 
     /* The accept list holds the peer's current RPA in place of its identity,
      * so the controller matches the advertisements it actually hears. */
-    case OP_LE_ADD_FAL:
-    case OP_LE_DEL_FAL:
+    case OP_LE_ADD_FAL: {
         if (plen < 7) break;
-        substitute(c, &p[0], &p[1]);
+        struct bt_rl_entry *e = rl_find(c, p[0], &p[1]);
+        if (substitute(c, &p[0], &p[1]) && e != NULL) {
+            e->fal_sub = 1;
+            bcopy6(e->fal_sub_rpa, &p[1]);
+        }
+        break;
+    }
+    case OP_LE_DEL_FAL: {
+        if (plen < 7) break;
+        /* Remove exactly what the add put there, which is not necessarily
+         * the entry's address now. */
+        struct bt_rl_entry *e = rl_find(c, p[0], &p[1]);
+        if (e != NULL && e->fal_sub) {
+            p[0] = 0x01;
+            bcopy6(&p[1], e->fal_sub_rpa);
+            e->fal_sub = 0;
+            c->substituted++;
+        }   /* otherwise the add went out unchanged, and so does this */
+        break;
+    }
+    case OP_LE_CLEAR_FAL:
+        for (int i = 0; i < BT_RL_SIZE; i++) { c->rl[i].fal_inj = 0; c->rl[i].fal_sub = 0; }
         break;
 
     case OP_LE_CREATE_CONN:
@@ -312,7 +594,7 @@ static int resolve_addr(struct bt_ctx *c, uint8_t *type, uint8_t *addr)
     if ((addr[5] & 0xc0) != 0x40) return 0;
 
     struct bt_rl_entry *e = rl_resolve(c, addr);
-    if (e == NULL) return 0;
+    if (e == NULL || e->guess) return 0;     /* a guess resolves nothing yet */
 
     /* A match: this advertisement came from a device BroadTek holds a key
      * for. Counted whether or not the report is rewritten, because the match
@@ -326,6 +608,30 @@ static int resolve_addr(struct bt_ctx *c, uint8_t *type, uint8_t *addr)
     bcopy6(addr, e->id_addr);
     *type = (uint8_t)(e->id_type ? 0x03 : 0x02);
     return 1;
+}
+
+static void link_up(struct bt_rl_entry *e, const uint8_t *q)
+{
+    e->on_link = 1;
+    e->handle = (uint16_t)((q[1] | (q[2] << 8)) & 0x0fff);
+}
+
+static struct bt_rl_entry *link_entry(struct bt_ctx *c, uint8_t lo, uint8_t hi)
+{
+    uint16_t handle = (uint16_t)((lo | (hi << 8)) & 0x0fff);
+    for (int i = 0; i < BT_RL_SIZE; i++)
+        if (c->rl[i].valid && c->rl[i].on_link && c->rl[i].handle == handle && !c->rl[i].have_irk)
+            return &c->rl[i];
+    return NULL;
+}
+
+static void prove(struct bt_ctx *c, struct bt_rl_entry *e)
+{
+    if (!e->have_rpa) return;
+    if (e->guess) c->proven++;
+    e->guess = 0;
+    e->proven = 1;
+    e->fails = 0;
 }
 
 enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
@@ -375,6 +681,33 @@ enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
         return BT_FORWARD;
     }
 
+    /* The proof: did the link to a guessed address encrypt with the
+     * identity's key? (status, handle, enabled; v2 adds the key size) */
+    if ((code == EVT_ENCRYPT_CHANGE || code == EVT_ENCRYPT_CHANGE_V2) && plen >= 4) {
+        struct bt_rl_entry *e = link_entry(c, p[1], p[2]);
+        if (e != NULL) {
+            if (p[0] == 0x00 && p[3] != 0x00) prove(c, e);
+            else if (p[0] != 0x00) reject(c, e);
+        }
+        return BT_FORWARD;
+    }
+    if (code == EVT_KEY_REFRESH && plen >= 3) {
+        struct bt_rl_entry *e = link_entry(c, p[1], p[2]);
+        if (e != NULL) {
+            if (p[0] == 0x00) prove(c, e);
+            else reject(c, e);
+        }
+        return BT_FORWARD;
+    }
+    if (code == EVT_DISCONN_COMPLETE && plen >= 4 && p[0] == 0x00) {
+        struct bt_rl_entry *e = link_entry(c, p[1], p[2]);
+        if (e != NULL) {
+            e->on_link = 0;
+            if (e->guess) reject(c, e);      /* connected, never encrypted */
+        }
+        return BT_FORWARD;
+    }
+
     if (code != EVT_LE_META || plen < 1) return BT_FORWARD;
 
     uint8_t sub = p[0];
@@ -389,6 +722,8 @@ enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
             if (off + 9 > avail) break;
             uint8_t dlen = q[off + 8];
             if (off + 9 + dlen + 1 > avail) break;
+            note_candidate(c, q[off] <= 0x01, q[off + 1], &q[off + 2], &q[off + 9], dlen,
+                           (int8_t)q[off + 9 + dlen]);
             resolve_addr(c, &q[off + 1], &q[off + 2]);
             off += 9 + dlen + 1;
         }
@@ -403,6 +738,8 @@ enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
             if (off + 24 > avail) break;
             uint8_t dlen = q[off + 23];
             if (off + 24 + dlen > avail) break;
+            note_candidate(c, q[off] & 0x01, q[off + 2], &q[off + 3], &q[off + 24], dlen,
+                           (int8_t)q[off + 13]);
             resolve_addr(c, &q[off + 2], &q[off + 3]);
             off += 24 + dlen;
         }
@@ -419,6 +756,7 @@ enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
                 bcopy6(&q[5], e->id_addr);
                 q[4] = e->id_type;
                 c->conn_translated++;
+                link_up(e, q);
             }
         }
         return BT_FORWARD;
@@ -435,6 +773,7 @@ enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
                 bcopy6(&q[17], &q[5]);               /* Peer_Resolvable_Private_Address */
                 bcopy6(&q[5], e->id_addr);
                 q[4] = (uint8_t)(e->id_type ? 0x03 : 0x02);
+                link_up(e, q);
             }
         }
         return BT_FORWARD;

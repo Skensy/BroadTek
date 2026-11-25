@@ -7,7 +7,10 @@
  * Command Complete the controller is about to send anyway (rejecting a command
  * it does not know), and every accept-list entry BroadTek needs is a command
  * the host is already sending. Both are edited in flight, which is why no
- * packet has to be injected into either direction. */
+ * packet has to be injected into either direction -- with one exception: an
+ * address guessed for a keyless identity goes on the accept list beside it,
+ * which needs an accept-list command of BroadTek's own
+ * (bt_guess_before_command). */
 #ifndef BT_CORE_H
 #define BT_CORE_H
 
@@ -18,6 +21,27 @@
 #define BT_PENDING_MAX  8
 #define BT_REPLY_MAX    16
 #define BT_SMP_MAX      8
+#define BT_CAND_MAX     32
+#define BT_REJECT_MAX   6
+
+/* How long, in the caller's milliseconds (bt_ctx.now), an advertisement keeps
+ * a private address in play. Apple devices advertise NearbyInfo several times
+ * a second while awake, so a candidate unheard for this long is gone. */
+#define BT_CAND_FRESH_MS   30000u
+/* A rotated address shows up within this long of the old one going quiet. */
+#define BT_SUCCESSOR_MS    15000u
+
+/* A private address an Apple device is advertising right now, with Apple's
+ * NearbyInfo record in it. These are the only addresses a keyless identity
+ * can be guessed onto (see bt_hci.c, "Guessing and proving"). */
+struct bt_candidate {
+    uint8_t  used;
+    uint8_t  connectable;   /* ever seen in a connectable advertisement */
+    uint8_t  addr[6];
+    int8_t   rssi;
+    uint32_t first_seen;
+    uint32_t seen;
+};
 
 struct bt_rl_entry {
     uint8_t valid;
@@ -29,6 +53,30 @@ struct bt_rl_entry {
     uint8_t rpa[6];         /* last RPA seen for this identity */
     uint8_t pinned;         /* installed from userspace: bluetoothd's own clear
                              * and delete leave it, since it never added it */
+
+    /* Keyless entries only: the private address was guessed, not resolved,
+     * and stays a guess until a link to it encrypts with the identity's key. */
+    uint8_t  guess;
+    uint8_t  proven;        /* a link to `rpa` encrypted: it is this device */
+    uint8_t  on_link;
+    uint16_t handle;
+    /* What the controller's accept list really holds for this identity: a
+     * guess BroadTek added beside it, or the address it was replaced by. A
+     * removal has to name exactly that, even if `rpa` has moved on since. */
+    uint8_t  fal_inj, fal_sub;
+    uint8_t  fal_inj_rpa[6], fal_sub_rpa[6];
+    uint32_t rpa_seen;      /* last advertisement from `rpa`, for successors */
+    uint8_t  fails;         /* guesses disproven before any was proven */
+    uint8_t  n_rejected;
+    uint8_t  rejected[BT_REJECT_MAX][6];
+};
+
+/* Accept-list commands BroadTek has to send ahead of one of bluetoothd's
+ * (LE Add/Remove Device To/From Filter Accept List, 10 bytes each). */
+#define BT_INJECT_MAX 4
+struct bt_inject {
+    uint8_t n;
+    uint8_t cmd[BT_INJECT_MAX][10];
 };
 
 /* A command BroadTek answered on the controller's behalf: when its Command
@@ -94,6 +142,15 @@ struct bt_ctx {
      * not recognise the device it just connected to. */
     uint32_t conn_events;        /* LE Connection Complete, plain or enhanced */
     uint32_t conn_translated;    /* ... whose peer address was put back */
+
+    /* Keyless identities (the iPhone): which private address is it now? */
+    uint8_t  guessing;           /* set by the caller to turn guessing on */
+    uint32_t now;                /* the caller's clock, milliseconds */
+    struct bt_candidate cand[BT_CAND_MAX];
+    uint32_t guesses;            /* addresses guessed for an identity */
+    uint32_t proven;             /* ... and proven by an encrypted link */
+    uint32_t rejected;           /* ... and disproven */
+    uint32_t stale;              /* proven addresses dropped after rotating */
 };
 
 enum bt_verdict {
@@ -121,6 +178,14 @@ enum bt_verdict bt_hci_on_command(struct bt_ctx *c, uint8_t *pkt, size_t len);
  * and is always set. */
 enum bt_verdict bt_hci_on_event(struct bt_ctx *c, uint8_t *pkt, size_t len,
                                 size_t cap, size_t *out_len);
+
+/* Before one of bluetoothd's commands is forwarded: the accept-list commands
+ * BroadTek has to send first so a guessed address stands beside an identity
+ * it has no proven address for (see bt_hci.c, "Guessing and proving"). The
+ * caller sends out->cmd[0..n-1] in order, each to completion, and must not let
+ * their Command Completes reach the host. Call before bt_hci_on_command. */
+void bt_guess_before_command(struct bt_ctx *c, const uint8_t *pkt, size_t len,
+                             struct bt_inject *out);
 
 /* pkt: an HCI ACL data packet (handle and flags LE16, total length LE16, then
  * the payload). Read-only: it captures an IRK out of a bonding exchange and

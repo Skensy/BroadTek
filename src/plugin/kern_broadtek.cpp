@@ -98,6 +98,18 @@ static volatile bool g_rtl_ready;
 static OSNumber *g_rtl_phy_events, *g_rtl_dle_events;
 static OSNumber *g_rtl_phy_status, *g_rtl_dle_status;
 static volatile SInt32 g_intel_inj_pending;
+/* Keyless identities (the iPhone): accept-list guesses proven by encryption,
+ * src/core/bt_hci.c "Guessing and proving". On with -broadtekrw; off with
+ * -broadtekguessoff. */
+static bool g_guess;
+static IOLock *g_guess_lock;
+static volatile SInt32 g_guess_inj_pending;
+static volatile uint16_t g_guess_inj_op;
+static uint64_t g_guess_sent, g_guess_failed, g_guess_timeouts;
+static uint32_t nowMs();
+static void publishGuess();
+static OSNumber *g_n_guesses, *g_n_guess_proven, *g_n_guess_rejected, *g_n_guess_stale,
+                *g_n_guess_sent, *g_n_guess_failed, *g_n_guess_timeouts, *g_n_guess_status;
 static OSNumber *g_n_intel_pages;
 /* Completion context: the link-ready reports (below). Returns the new length
  * if it rewrote buf, 0 to pass the event on as it is. */
@@ -1168,6 +1180,7 @@ static bool onBluetoothTerminated(void *, void *, IOService *service, IONotifier
     g_rtl_ready = false;
     bt_adv_reset(&g_adv_state);
     bt_ctx_init(&g_ctx);
+    g_ctx.guessing = g_guess;
     memcpy(pipes, g_bt_pipes, sizeof(pipes));
     bzero(g_bt_pipes, sizeof(g_bt_pipes));
     IOSimpleLockUnlock(g_lock);
@@ -1370,6 +1383,24 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                     }
                 }
 
+                /* The reply to one of BroadTek's accept-list commands. The
+                 * bluetoothd command behind it is held until this arrives, so
+                 * while one is pending the next reply to that opcode is ours. */
+                if (g_guess_inj_pending > 0 && buf[0] == 0x0e && len >= 6 &&
+                    buf[3] == static_cast<uint8_t>(g_guess_inj_op) &&
+                    buf[4] == static_cast<uint8_t>(g_guess_inj_op >> 8)) {
+                    OSDecrementAtomic(&g_guess_inj_pending);
+                    if (g_n_guess_status != nullptr) g_n_guess_status->setValue(buf[5]);
+                    buf[1] = 0x03; buf[3] = 0x00; buf[4] = 0x00;   /* keep num_packets */
+                    deliver = writeEvent(md, buf, 5, status);
+                    s->md = nullptr;
+                    OSDecrementAtomic(&s->busy);
+                    if (orig.action != nullptr)
+                        orig.action(owner != nullptr ? owner : orig.owner, orig.parameter,
+                                    status, deliver);
+                    return;
+                }
+
                 /* Our own 0x2005's reply (Intel). bluetoothd's command that
                  * triggered it is held until this arrives, so while one is
                  * pending the next 0x2005 reply is ours. */
@@ -1402,8 +1433,11 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                 uint8_t original[kMaxHCI];
                 memcpy(original, buf, len);
                 IOSimpleLockLock(g_lock);
+                g_ctx.now = nowMs();
                 v = bt_hci_on_event(&g_ctx, buf, len, room, &out);
                 IOSimpleLockUnlock(g_lock);
+                if (g_guess && (buf[0] == 0x05 || buf[0] == 0x08 || buf[0] == 0x30 || buf[0] == 0x59))
+                    publishGuess();
 
                 /* A transfer cannot be un-sent, so an event the host must not
                  * see becomes a Command Complete for the NOP opcode: the
@@ -1787,6 +1821,72 @@ static void advSendSetAddress(void *that, uint8_t pipeRef, const StandardUSB::De
     }
     g_adv_inj_timeouts++;
     if (g_n_adv_inj_timeouts != nullptr) g_n_adv_inj_timeouts->setValue(g_adv_inj_timeouts);
+}
+
+static uint32_t nowMs()
+{
+    uint64_t ns;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return static_cast<uint32_t>(ns / 1000000ull);
+}
+
+static void publishGuess()
+{
+    if (g_n_guesses != nullptr)        g_n_guesses->setValue(g_ctx.guesses);
+    if (g_n_guess_proven != nullptr)   g_n_guess_proven->setValue(g_ctx.proven);
+    if (g_n_guess_rejected != nullptr) g_n_guess_rejected->setValue(g_ctx.rejected);
+    if (g_n_guess_stale != nullptr)    g_n_guess_stale->setValue(g_ctx.stale);
+    if (g_n_guess_sent != nullptr)     g_n_guess_sent->setValue(g_guess_sent);
+    if (g_n_guess_failed != nullptr)   g_n_guess_failed->setValue(g_guess_failed);
+    if (g_n_guess_timeouts != nullptr) g_n_guess_timeouts->setValue(g_guess_timeouts);
+}
+
+/* Caller context, bluetoothd's thread: may block. One accept-list command of
+ * BroadTek's own, sent and completed before bluetoothd's command goes out;
+ * its Command Complete becomes a NOP in the event path (onEventDone). */
+static void guessSend(void *that, uint8_t pipeRef, const StandardUSB::DeviceRequest &like,
+                      const uint8_t *cmd, uint32_t timeout)
+{
+    IOMemoryDescriptor *md = ownedCopy(cmd, 10);
+    if (md == nullptr) { g_guess_failed++; return; }
+
+    StandardUSB::DeviceRequest req = like;
+    req.wLength = 10;
+    uint32_t sent = 0;
+    g_guess_inj_op = static_cast<uint16_t>(cmd[0] | (cmd[1] << 8));
+    OSIncrementAtomic(&g_guess_inj_pending);
+    IOReturn r = FunctionCast(onUserClientControlRequest, g_orig_uc_ctrl)(that, pipeRef, req, md,
+                                                                          nullptr, sent, timeout);
+    md->release();
+    if (r != kIOReturnSuccess || sent != 10) {
+        OSDecrementAtomic(&g_guess_inj_pending);
+        g_guess_failed++;
+        return;
+    }
+    g_guess_sent++;
+    for (int i = 0; i < 500 && g_guess_inj_pending > 0; i++) IOSleep(1);
+    if (g_guess_inj_pending > 0) {
+        /* Half a second with no reply: stop waiting for it, or bluetoothd's
+         * own reply to the same opcode would be taken for ours. */
+        g_guess_inj_pending = 0;
+        g_guess_timeouts++;
+    }
+}
+
+/* Caller context. Accept-list guesses BroadTek must place before this command. */
+static void guessBeforeCommand(void *that, uint8_t pipeRef, const StandardUSB::DeviceRequest &request,
+                               const uint8_t *buf, size_t len, uint32_t timeout)
+{
+    if (!g_guess || len < 3 || buf[1] != 0x20) return;
+    bt_inject in;
+    IOLockLock(g_guess_lock);
+    IOSimpleLockLock(g_lock);
+    g_ctx.now = nowMs();
+    bt_guess_before_command(&g_ctx, buf, len, &in);
+    IOSimpleLockUnlock(g_lock);
+    for (uint8_t i = 0; i < in.n; i++) guessSend(that, pipeRef, request, in.cmd[i], timeout);
+    IOLockUnlock(g_guess_lock);
+    publishGuess();
 }
 
 /* Caller context. Track 0x2005 and 0x2036; before an enable, address the sets. */
@@ -2240,6 +2340,7 @@ static IOReturn onUserClientControlRequest(void *that, uint8_t pipeRef,
             bool setupEdited = g_rtl_ready ? bt_link_enable_reports(buf, len) :
                 intelBeforeCommand(that, pipeRef, request, buf, len, timeout);
             if (g_intel || g_rtl_ready) intelNoteClient(that, pipeRef, request, timeout);
+            guessBeforeCommand(that, pipeRef, request, buf, len, timeout);
 
             if (g_rw_cmds || setupEdited) {
                 /* A digest rather than a second 260-byte buffer on the stack.
@@ -2652,6 +2753,12 @@ void BRTK::init()
             g_adv_cache = registerSleepWakeInterest(onPowerMessage, nullptr) != nullptr;
     }
     bt_ctx_init(&g_ctx);
+    g_guess = g_rw_cmds && g_rw_events && !checkKernelArgument("-broadtekguessoff");
+    if (g_guess) {
+        g_guess_lock = IOLockAlloc();
+        g_guess = g_guess_lock != nullptr;
+    }
+    g_ctx.guessing = g_guess;
     for (int i = 0; i < kSlots; i++) g_slots[i].busy = 0;
 
     const char *stage = g_rw_cmds ? "full" : (g_rw_events ? "events" : "off");
@@ -2714,6 +2821,17 @@ void BRTK::init()
     g_n_substituted = makeCounter("broadtek-substituted");
     g_n_conn_events     = makeCounter("broadtek-conn-events");
     g_n_conn_translated = makeCounter("broadtek-conn-translated");
+    mark("broadtek-guessing", g_guess);
+    if (g_guess) {
+        g_n_guesses        = makeCounter("broadtek-guesses");
+        g_n_guess_proven   = makeCounter("broadtek-guess-proven");
+        g_n_guess_rejected = makeCounter("broadtek-guess-rejected");
+        g_n_guess_stale    = makeCounter("broadtek-guess-stale");
+        g_n_guess_sent     = makeCounter("broadtek-guess-cmds-sent");
+        g_n_guess_failed   = makeCounter("broadtek-guess-cmds-failed");
+        g_n_guess_timeouts = makeCounter("broadtek-guess-cmds-timeouts");
+        g_n_guess_status   = makeCounter("broadtek-guess-last-status");
+    }
     g_n_write_noprepare  = makeCounter("broadtek-write-noprepare");
     g_n_write_short      = makeCounter("broadtek-write-short");
     g_n_cmd_rebuffered      = makeCounter("broadtek-cmd-rebuffered");
